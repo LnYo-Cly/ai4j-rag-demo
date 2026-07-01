@@ -1,0 +1,36 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: ai4j-rag-demo
+
+# ---- ai4j starter (auto-configures PgVector / Ollama / Anthropic clients) ----
+ai:
+  okhttp:
+    log: BASIC
+  vector:
+    pgvector:
+      enabled: true
+      jdbc-url: jdbc:postgresql://localhost:5432/postgres
+      username: postgres
+      password: postgres
+      table-name: ai4j_rag_demo
+      distance-operator: "<=>"
+  ollama:
+    api-host: http://localhost:11434/
+    embedding-url: api/embed
+  anthropic:
+    # GLM coding-plan key 通过 Anthropic 兼容入口接入
+    api-host: https://open.bigmodel.cn/api/anthropic/
+    api-key: ${GLM_API_KEY:}
+    chat-completion-url: v1/messages
+    api-version: 2023-06-01
+
+# ---- demo business config ----
+rag:
+  dataset: ecommerce-kb
+  embedding-model: hf.co/Qwen/Qwen3-Embedding-0.6B-GGUF:latest
+  vector-dimension: 1024
+  glm-model: glm-4.6
+  top-k: 5
