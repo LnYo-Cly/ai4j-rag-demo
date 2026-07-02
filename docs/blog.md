@@ -470,6 +470,30 @@ premium 租户能看到 `marketing.md`（秒杀不叠加券）+ `merchant.md`（
 
 `capturedToolNodes=1` 就是 RAG 检索的 TOOL 节点——它和 MODEL 节点一起进了 `IoCaptureSink`，**整链统一可观测**（可重放、可从失败点恢复、可审计）。对比 `/api/rag/ask`（RAG 直调，检索只在 `RagTrace`），这是"RAG 接入 agent 可观测链路"的实证——不再割裂。
 
+### 18.7 完整执行 trace（一次请求，每一步可见）
+
+`/api/rag/ask` 把一次请求的完整执行轨迹写进响应（`rewrittenQuery` / `retrievedHits` / `rerankedHits` / `context` / `answer`），排障/可观测时一眼看清每步发生了什么。以"退款怎么弄"为例（demo 实际输出）：
+
+```
+STEP 1  input        : 退款怎么弄
+STEP 2  rewritten    : 退款操作流程                    ← Query Rewrite（口语→正式术语）
+STEP 3  retrievedHits（retrieve 后、rerank 前）:
+          - refund-rules.md   score=0.491
+          - after-sales.md    score=0.353
+          - logistics.md      score=0.314
+STEP 4  rerankedHits （LlmReranker 后）:
+          - refund-rules.md   rerankScore=0.491
+          - after-sales.md    rerankScore=0.353
+          - logistics.md      rerankScore=0.314
+STEP 5  context      : [S1] refund-rules.md\n# 退款规则\n## 退款申请时效\n用户在订单签收后 7 天内…
+STEP 6  answer       : 根据参考资料，退款操作流程如下：1. 发起申请（注意时效）：订单签收 7 天内…
+         hitCount=3   cached=false   degraded=false
+```
+
+**每一步的中间产物**——改写后 query、召回原始顺序 + 分数、重排后顺序 + 分数、组装的上下文（带 `[S1]` 引用）、最终答案——都在响应里。线上出问题时不用猜是改写、召回、重排还是生成哪一步的锅，看 trace 一目了然。
+
+> 这是 RAG 级 trace（`RagResult.getTrace()` 的 `retrievedHits`/`rerankedHits`）。如果走 agent 端点（18.6），还会加上 MODEL 节点的 prompt/response 捕获——两层 trace 互补。
+
 ## 十九、常见坑位
 1. 只 TopK 向量不过滤 → 串库/越权（用 dataset+filter 前置）
 2. chunk 切太碎/太大

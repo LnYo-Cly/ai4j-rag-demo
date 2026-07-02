@@ -10,9 +10,11 @@ import io.github.lnyocly.ai4j.rag.DefaultRagContextAssembler;
 import io.github.lnyocly.ai4j.rag.DefaultRagService;
 import io.github.lnyocly.ai4j.rag.DenseRetriever;
 import io.github.lnyocly.ai4j.rag.RagCitation;
+import io.github.lnyocly.ai4j.rag.RagHit;
 import io.github.lnyocly.ai4j.rag.RagQuery;
 import io.github.lnyocly.ai4j.rag.RagResult;
 import io.github.lnyocly.ai4j.rag.RagService;
+import io.github.lnyocly.ai4j.rag.RagTrace;
 import io.github.lnyocly.ai4j.rag.demo.config.RagProperties;
 import io.github.lnyocly.ai4j.rag.demo.domain.ChatRequest;
 import io.github.lnyocly.ai4j.rag.demo.domain.RagAnswer;
@@ -33,15 +35,13 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 /**
- * RAG 在线问答主链编排。
+ * RAG 在线问答主链编排。每一步的中间产物都写进 RagAnswer，让一次请求的完整执行轨迹可见：
+ * 输入 → 改写（rewrittenQuery）→ 召回（retrievedHits）→ 重排（rerankedHits）→ 上下文（context）→ 生成（answer）→ 输出。
  *
  * 检索：DenseRetriever（PgVector KNN，带多租户 permissionTag 前置过滤）
- * 重排：LlmReranker（GLM 批量打分；Ollama 无 rerank 端点的兜底方案）
- * 生成：GLM via IMessagesService（Anthropic Messages 协议）
- * 缓存：Caffeine（应用层 answer cache，key = tenant::question）
- *
- * 多租户：tenant=default 只看 permissionTag=public 的知识；
- *         tenant=premium 看 public + premium（运营/风控内部规则）。
+ * 重排：LlmReranker（GLM 打分）
+ * 生成：GLM via IMessagesService（Anthropic Messages，拒答约束）
+ * 缓存：Caffeine（key = tenant::originalQuestion）
  */
 @Service
 public class RagQueryService {
@@ -77,23 +77,38 @@ public class RagQueryService {
             return cached;
         }
 
-        // 多租户：权限标签前置过滤（PgVector metadata jsonb where，KNN 前完成）
+        // ① 多租户：权限标签前置过滤（PgVector metadata jsonb where，KNN 前完成）
         Map<String, Object> filter = new LinkedHashMap<String, Object>();
         filter.put("permissionTag", permissionTagsFor(request.getTenantId()));
 
+        // ② Query Rewrite：口语 → 正式术语
         String rewritten = queryRewriteService.rewrite(request.getQuestion());
+
+        // ③ 检索 + ④ 重排（RagService 内部），开 trace 拿到 retrieved/reranked 两份顺序
         RagQuery query = RagQuery.builder()
                 .query(rewritten)
                 .dataset(ragProperties.getDataset())
                 .embeddingModel(ragProperties.getEmbeddingModel())
                 .topK(ragProperties.getTopK())
                 .filter(filter)
+                .includeTrace(Boolean.TRUE)
                 .build();
-
         RagResult result = ragService.search(query);
+
+        // ⑤ 上下文组装（带 [S1][S2] 引用标记）
         String context = result.getContext() == null ? "" : result.getContext();
         boolean degraded = context.isBlank();
 
+        // trace：召回原始顺序 + 重排后顺序
+        RagTrace trace = result.getTrace();
+        List<RagHit> retrievedSrc = (trace != null && trace.getRetrievedHits() != null)
+                ? trace.getRetrievedHits() : result.getHits();
+        List<RagHit> rerankedSrc = (trace != null && trace.getRerankedHits() != null)
+                ? trace.getRerankedHits() : result.getHits();
+        List<Map<String, Object>> retrievedHits = mapHits(retrievedSrc, false);
+        List<Map<String, Object>> rerankedHits = mapHits(rerankedSrc, true);
+
+        // 引用溯源
         List<ReferenceItem> references = new ArrayList<ReferenceItem>();
         List<RagCitation> citations = result.getCitations() == null
                 ? Collections.<RagCitation>emptyList() : result.getCitations();
@@ -105,7 +120,9 @@ public class RagQueryService {
                     .build());
         }
 
+        // ⑥ 生成（GLM，拒答约束）
         String answer = generate(request.getQuestion(), context, degraded);
+
         RagAnswer ragAnswer = RagAnswer.builder()
                 .answer(answer)
                 .references(references)
@@ -113,6 +130,9 @@ public class RagQueryService {
                 .degraded(degraded)
                 .cached(false)
                 .rewrittenQuery(rewritten)
+                .retrievedHits(retrievedHits)
+                .rerankedHits(rerankedHits)
+                .context(context)
                 .build();
         answerCache.put(cacheKey, ragAnswer);
         return ragAnswer;
@@ -125,6 +145,30 @@ public class RagQueryService {
         stats.put("hitRate", answerCache.stats().hitRate());
         stats.put("requestCount", answerCache.stats().requestCount());
         return stats;
+    }
+
+    private List<Map<String, Object>> mapHits(List<RagHit> hits, boolean reranked) {
+        List<Map<String, Object>> out = new ArrayList<Map<String, Object>>();
+        if (hits == null) {
+            return out;
+        }
+        for (RagHit h : hits) {
+            if (h == null) {
+                continue;
+            }
+            Map<String, Object> m = new LinkedHashMap<String, Object>();
+            m.put("sourceName", h.getSourceName());
+            m.put("sectionTitle", h.getSectionTitle());
+            if (reranked) {
+                if (h.getRerankScore() != null) {
+                    m.put("rerankScore", h.getRerankScore());
+                }
+            } else if (h.getScore() != null) {
+                m.put("score", h.getScore());
+            }
+            out.add(m);
+        }
+        return out;
     }
 
     private List<String> permissionTagsFor(String tenant) {
