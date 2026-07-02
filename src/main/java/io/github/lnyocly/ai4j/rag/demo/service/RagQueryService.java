@@ -97,7 +97,7 @@ public class RagQueryService {
 
         // ⑤ 上下文组装（带 [S1][S2] 引用标记）
         String context = result.getContext() == null ? "" : result.getContext();
-        boolean degraded = context.isBlank();
+        boolean degraded = context.trim().isEmpty();
 
         // trace：召回原始顺序 + 重排后顺序
         RagTrace trace = result.getTrace();

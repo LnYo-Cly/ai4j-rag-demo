@@ -57,7 +57,7 @@ public class KnowledgeIngestionService {
         Resource[] resources = new PathMatchingResourcePatternResolver().getResources(pattern);
         int total = 0;
         for (Resource resource : resources) {
-            String content = new String(resource.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            String content = readAll(resource.getInputStream());
             String docId = UUID.nameUUIDFromBytes(
                     resource.getFilename().getBytes(StandardCharsets.UTF_8)).toString();
             Map<String, Object> metadata = new LinkedHashMap<String, Object>();
@@ -88,5 +88,16 @@ public class KnowledgeIngestionService {
             log.info("Ingested [{}] {}: {} chunks", permissionTag, resource.getFilename(), result.getUpsertedCount());
         }
         return total;
+    }
+
+    /** Java 8 兼容的流读取（InputStream.readAllBytes 是 Java 9+）。 */
+    private static String readAll(java.io.InputStream in) throws java.io.IOException {
+        java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+        byte[] tmp = new byte[4096];
+        int n;
+        while ((n = in.read(tmp)) != -1) {
+            buf.write(tmp, 0, n);
+        }
+        return new String(buf.toByteArray(), StandardCharsets.UTF_8);
     }
 }

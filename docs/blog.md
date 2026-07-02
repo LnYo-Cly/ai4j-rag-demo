@@ -1,4 +1,6 @@
-# ai4j + PgVector + Ollama：用 Java 跑通一套企业级 RAG
+# 为你的 JDK8 老项目，增加企业级的 RAG 系统
+
+> 很多团队的核心业务还跑在 JDK 8 + Spring Boot 2.x 上——升级 JDK 17 + SB 3 牵一发而动全身，短期不动；但 AI/RAG 又是必须补的能力。本文就用 **Spring Boot 2.7（JDK 8 末代 LTS）+ ai4j + PostgreSQL/pgvector + 本地 Ollama + GLM**，给一个 JDK8 老项目加上一整套企业级 RAG：摄入、Query Rewrite、混合检索、重排、多租户、评估、缓存、可观测 trace、引用溯源——配套 [开箱即用的 demo](https://github.com/LnYo-Cly/ai4j-rag-demo)，每个能力都真实跑过，下面所有运行结果都是 demo 实际输出。
 
 > 本文用一套更轻、更通用的技术栈——Java AI SDK **ai4j** + 你大概率已经有的 **PostgreSQL/pgvector** + 本地免费的 **Ollama embedding** + **GLM** 生成——从原理、架构、12 条设计原则、生产代码、高并发、多租户、可观测、部署一路讲到真实案例与检索质量评估。配套 [开箱即用的 demo](https://github.com/LnYo-Cly/ai4j-rag-demo) 里，**每一个能力都真实跑过**，下面所有运行结果都是 demo 实际输出，不是杜撰。
 
@@ -107,7 +109,7 @@
 
 | 维度 | 方案 |
 |---|---|
-| Web 框架 | Spring Boot 3.2 |
+| Web 框架 | Spring Boot 2.7（JDK 8 末代 LTS） |
 | AI SDK | ai4j 2.4.0（starter） |
 | Embedding | Ollama + Qwen3-Embedding-0.6B（1024 维） |
 | Chat | GLM（Anthropic Messages，`IMessagesService`） |
@@ -232,7 +234,7 @@ CREATE INDEX ... USING hnsw (embedding vector_cosine_ops);
 
 ## 十三、生产级代码实现
 
-### 13.1 依赖（SB 3.2 + ai4j starter + pg + caffeine）
+### 13.1 依赖（SB 2.7 + JDK 8 + ai4j starter + pg + caffeine）
 ```xml
 <dependency>
   <groupId>io.github.lnyo-cly</groupId>
@@ -242,7 +244,7 @@ CREATE INDEX ... USING hnsw (embedding vector_cosine_ops);
 <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId></dependency>
 <dependency><groupId>com.github.ben-manes.caffeine</groupId><artifactId>caffeine</artifactId></dependency>
 ```
-ai4j starter 编译于 SB 2.3/Java 8，**实测 SB 3.2 运行时兼容**。
+ai4j starter 编译于 SB 2.3/Java 8，**demo 用 SB 2.7（同属 2.x，原生兼容，无需任何适配）**。如果你是 SB 3 / JDK 17 项目，starter 也实测可用（见 22 章）。
 
 ### 13.2 application.yml
 ```yaml
@@ -525,7 +527,7 @@ STEP 6  answer       : 根据参考资料，退款操作流程如下：1. 发起
 3. ~~RAG-as-Agent-Tool 无现成封装~~ **已解决（ai4j 2.4.0）**：`RagTool`（PR #172）+ `AgentBuilder.capture()` 让 RAG 作为 agent tool 接入统一可观测链路
 4. **Ollama 无 `/api/rerank` 端点**——`OllamaRerankService` 在 Ollama 上 404，本地 rerank 要用 LlmReranker 兜底或接 cloud（Jina/Doubao）
 5. **starter 默认装配多个 VectorStore bean**——注入接口 `VectorStore` 会歧义，要注入具体类型
-6. **starter 锁 Spring Boot 2.3**（Java 8 约束）——实测 SB 3 运行时兼容，但编译期绑定 2.3
+6. **starter 编译于 Spring Boot 2.3**（Java 8 约束）——在 SB 2.x（如本文的 2.7）原生兼容；SB 3 / JDK 17 项目也实测可用
 7. **`@PostConstruct` 用 javax**（starter 内）——SB 3 靠 `javax.annotation-api` 兜，实测可用但非 jakarta 原生
 8. **starter 的 pineconeVectorStore 无 `@ConditionalOnProperty` 守卫**——总被创建（导致上述多 bean 歧义）
 

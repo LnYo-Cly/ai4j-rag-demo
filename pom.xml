@@ -7,7 +7,7 @@
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
-        <version>3.2.5</version>
+        <version>2.7.18</version>
         <relativePath/>
     </parent>
 
@@ -18,7 +18,7 @@
     <description>企业级 RAG 开箱即用 demo: ai4j + PgVector + Ollama + GLM</description>
 
     <properties>
-        <java.version>17</java.version>
+        <java.version>1.8</java.version>
         <ai4j.version>2.4.0</ai4j.version>
     </properties>
 
