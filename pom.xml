@@ -33,6 +33,12 @@
             <artifactId>ai4j-spring-boot-starter</artifactId>
             <version>${ai4j.version}</version>
         </dependency>
+        <!-- ai4j-agent: for the agent endpoint demonstrating RAG-as-tool + IoCapture (unified observability) -->
+        <dependency>
+            <groupId>io.github.lnyo-cly</groupId>
+            <artifactId>ai4j-agent</artifactId>
+            <version>${ai4j.version}</version>
+        </dependency>
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
