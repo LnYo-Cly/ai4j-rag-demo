@@ -20,4 +20,7 @@ public class RagAnswer {
     private int hitCount;
     /** 是否降级（检索为空时直接 LLM 兜底）。 */
     private boolean degraded;
+
+    /** 是否命中答案缓存。 */
+    private boolean cached;
 }
