@@ -7,6 +7,8 @@ import io.github.lnyocly.ai4j.platform.anthropic.chat.entity.AnthropicChatComple
 import io.github.lnyocly.ai4j.platform.anthropic.chat.entity.AnthropicContentBlock;
 import io.github.lnyocly.ai4j.platform.anthropic.chat.entity.AnthropicMessage;
 import io.github.lnyocly.ai4j.rag.DefaultRagContextAssembler;
+import io.github.lnyocly.ai4j.rag.NoopReranker;
+import io.github.lnyocly.ai4j.rag.Reranker;
 import io.github.lnyocly.ai4j.rag.DefaultRagService;
 import io.github.lnyocly.ai4j.rag.DenseRetriever;
 import io.github.lnyocly.ai4j.rag.RagCitation;
@@ -58,7 +60,7 @@ public class RagQueryService {
         this.messagesService = aiService.getMessagesService(PlatformType.ANTHROPIC);
         this.ragService = new DefaultRagService(
                 new DenseRetriever(aiService.getEmbeddingService(PlatformType.OLLAMA), vectorStore),
-                new LlmReranker(this.messagesService, ragProperties.getGlmModel(), ragProperties.getTopK()),
+                resolveReranker(aiService),
                 new DefaultRagContextAssembler());
         this.answerCache = Caffeine.newBuilder()
                 .maximumSize(1000)
@@ -136,6 +138,27 @@ public class RagQueryService {
                 .build();
         answerCache.put(cacheKey, ragAnswer);
         return ragAnswer;
+    }
+
+    /**
+     * 按 {@code rag.reranker} 配置选重排器——这就是"reranker 取舍"的开关：
+     * <ul>
+     *   <li><b>none</b>：不重排，直接用检索分数排序（HybridRetriever 的 RRF 融合本身就是不错的排序，
+     *       成本敏感 / 召回质量已够时选这个，省一次模型调用）</li>
+     *   <li><b>jina</b>：专用 rerank 模型（Jina），精度最高，多一次外部 API 调用（成本+延迟）</li>
+     *   <li><b>llm</b>（默认）：用 GLM 对召回结果打分重排，本地无专用 rerank 模型时的兜底</li>
+     * </ul>
+     * 不是每条链路都需要 reranker——这是 demo 把它做成可选配置的原因。
+     */
+    private Reranker resolveReranker(AiService aiService) {
+        String mode = ragProperties.getReranker() == null ? "llm" : ragProperties.getReranker().trim().toLowerCase();
+        if ("none".equals(mode)) {
+            return new NoopReranker();
+        }
+        if ("jina".equals(mode)) {
+            return aiService.getModelReranker(PlatformType.JINA, ragProperties.getJinaRerankModel());
+        }
+        return new LlmReranker(this.messagesService, ragProperties.getGlmModel(), ragProperties.getTopK());
     }
 
     /** 暴露缓存统计（命中率/大小），给可观测用。 */

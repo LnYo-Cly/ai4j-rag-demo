@@ -25,6 +25,8 @@ ai:
     api-host: https://open.bigmodel.cn/api/anthropic/
     api-key: ${GLM_API_KEY:}
     chat-completion-url: v1/messages
+  jina:
+    api-key: ${JINA_API_KEY:}
     api-version: 2023-06-01
 
 # ---- demo business config ----
@@ -34,3 +36,5 @@ rag:
   vector-dimension: 1024
   glm-model: glm-4.6
   top-k: 5
+  reranker: llm  # none（不重排，靠混合检索排序）/ jina（专用 rerank 模型）/ llm（GLM 打分兜底）
+  jina-rerank-model: jina-reranker-v2-base-multilingual

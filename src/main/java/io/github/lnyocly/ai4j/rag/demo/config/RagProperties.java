@@ -26,4 +26,10 @@ public class RagProperties {
 
     /** 检索 topK。 */
     private int topK = 5;
+
+    /** 重排策略：none（不重排，靠检索排序）/ jina（专用 rerank 模型）/ llm（GLM 打分兜底）。 */
+    private String reranker = "llm";
+
+    /** Jina rerank 模型（reranker=jina 时用）。 */
+    private String jinaRerankModel = "jina-reranker-v2-base-multilingual";
 }
