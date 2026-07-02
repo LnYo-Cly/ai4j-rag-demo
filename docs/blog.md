@@ -796,20 +796,85 @@ spec:
 3. `DefaultRagContextAssembler` 组装带 `[S1] [S2]` 引用标记的上下文
 4. GLM 生成
 
-### 18.4 GLM 的真实回答
+### 18.4 真实运行：启动日志
 
-> 关于秒杀商品在签收后的退款政策：
-> 1. **不支持 7 天无理由退款**——参与秒杀活动的特殊商品不支持 7 天无理由退款（S1）。
-> 2. **存在质量问题可申请退款**——不受活动商品限制约束，可按售后规则申请（S1、S2）。
-> 3. **时效**——质量问题售后需在签收后 15 天内申请（S2）；退款审核 1-3 个工作日，到账 3-5 个工作日（S1）。
->
-> `references`: [refund-rules.md（秒杀活动商品退款限制）, after-sales.md（质量问题售后）]
+`mvn spring-boot:run` 启动时，日志能看到完整链路就绪：
 
-### 18.5 这个案例体现了什么
+```
+i.g.l.a.r.d.c.PgVectorSchemaInitializer  : PgVector schema ready: ai4j_rag_demo (dim=1024)
+i.g.l.ai4j.rag.demo.RagDemoApplication   : Started RagDemoApplication in 3.579 seconds
+i.g.l.a.r.d.s.KnowledgeIngestionService  : Ingested after-sales.md: 1 chunks
+i.g.l.a.r.d.s.KnowledgeIngestionService  : Ingested logistics.md: 1 chunks
+i.g.l.a.r.d.s.KnowledgeIngestionService  : Ingested refund-rules.md: 1 chunks
+i.g.l.a.r.d.s.KnowledgeIngestionService  : Knowledge ingestion done: 3 docs, 3 chunks total
+```
 
-- 不是只召回"最相似一段"，而是把"活动例外规则"和"通用规则"一起组织成可解释答案
-- 答案带来源引用（S1/S2），可回溯、可审核
-- 检索质量决定答案质量——召回对了，模型才答对；拒答约束让它在资料不足时说"无法确认"而不是瞎编
+`@PostConstruct` 建表 → Spring Boot 启动 → `ApplicationRunner` 摄入 3 个文档（Tika 解析 → 切块 → Qwen3 embedding → PgVector upsert，幂等可复跑）。**每一步在日志里都看得见。**
+
+### 18.5 真实运行：3 个问答（curl + 响应）
+
+**Q1：秒杀商品签收后还能申请退款吗？**（多文档组合）
+
+```bash
+curl -X POST http://localhost:8080/api/rag/ask \
+  -H "Content-Type: application/json;charset=UTF-8" \
+  -d '{"question":"秒杀商品签收后还能申请退款吗？"}'
+```
+
+```json
+{
+  "answer": "根据参考资料，秒杀商品签收后的退款政策：\n1. 不支持 7 天无理由退款（参与秒杀活动的特殊商品）\n2. 存在质量问题可申请售后，需在签收后 15 天内\n3. 超过 7 天普通时效需联系客服走特殊流程，不一定通过",
+  "references": [
+    {"sourceName": "refund-rules.md", "sectionTitle": "秒杀活动商品退款限制", "snippet": "..."},
+    {"sourceName": "after-sales.md",  "sectionTitle": "质量问题售后",         "snippet": "..."},
+    {"sourceName": "logistics.md",    "sectionTitle": "签收认定",             "snippet": "..."}
+  ],
+  "hitCount": 3,
+  "degraded": false
+}
+```
+
+把"活动例外规则"（refund-rules）和"通用售后规则"（after-sales）一起召回，组合成可解释答案。
+
+**Q2：标准配送一般几天能送达？**（单文档精准命中）
+
+```json
+{
+  "answer": "根据参考资料，中国大陆地区标准配送一般为 2-5 个工作日送达；偏远地区（新疆、西藏、青海等）为 5-10 个工作日。",
+  "references": [
+    {"sourceName": "logistics.md", "sectionTitle": "标准配送时效"}
+  ],
+  "hitCount": 3,
+  "degraded": false
+}
+```
+
+精准命中物流文档，没有把退款/售后这些无关内容混进上下文。
+
+**Q3：我去年买的衣服现在还能退货吗？**（边界/拒答——知识库里没有"去年"这种条目）
+
+```json
+{
+  "answer": "根据当前知识库资料，去年购买的衣服不支持退货。原因：时效已过——普通商品 7 天无理由退货、质量问题售后 15 天内、退款申请 7 天内。您提到的'去年'远超上述售后时效。\n[S1] 售后政策：7 天无理由 / 15 天售后\n[S2] 退款规则：签收后 7 天内\n[S3] 物流时效：签收为时效起算点",
+  "references": [
+    {"sourceName": "after-sales.md"},
+    {"sourceName": "refund-rules.md"},
+    {"sourceName": "logistics.md"}
+  ],
+  "hitCount": 3,
+  "degraded": false
+}
+```
+
+这是**拒答约束的实战体现**：知识里没有"去年的衣服"这种条目，模型没有瞎编"可以退"或编造规则，而是基于召回的时效规则明确推断"不支持"，并给出 `[S1]/[S2]/[S3]` 依据。这正是抑制幻觉的关键。
+
+### 18.6 这个案例体现了什么
+
+- 不是只召回"最相似一段"，而是把"活动例外规则"和"通用规则"一起组织成可解释答案（Q1）
+- 检索精准，不污染上下文（Q2 只命中物流）
+- 拒答约束真实生效：知识不足/超边界时明确说"不支持"并给依据，而不是编造（Q3）
+- 答案带来源引用（S1/S2/S3），可回溯、可审核
+- 检索质量决定答案质量——召回对了，模型才答对
 
 ## 十九、常见问题与高频坑位
 
