@@ -50,8 +50,10 @@ public class RagQueryService {
     private final IMessagesService messagesService;
     private final RagService ragService;
     private final Cache<String, RagAnswer> answerCache;
+    private final QueryRewriteService queryRewriteService;
 
-    public RagQueryService(AiService aiService, PgVectorStore vectorStore, RagProperties ragProperties) {
+    public RagQueryService(AiService aiService, PgVectorStore vectorStore, RagProperties ragProperties,
+                           QueryRewriteService queryRewriteService) {
         this.ragProperties = ragProperties;
         this.messagesService = aiService.getMessagesService(PlatformType.ANTHROPIC);
         this.ragService = new DefaultRagService(
@@ -63,6 +65,7 @@ public class RagQueryService {
                 .expireAfterWrite(10, TimeUnit.MINUTES)
                 .recordStats()
                 .build();
+        this.queryRewriteService = queryRewriteService;
     }
 
     public RagAnswer ask(ChatRequest request) throws Exception {
@@ -78,8 +81,9 @@ public class RagQueryService {
         Map<String, Object> filter = new LinkedHashMap<String, Object>();
         filter.put("permissionTag", permissionTagsFor(request.getTenantId()));
 
+        String rewritten = queryRewriteService.rewrite(request.getQuestion());
         RagQuery query = RagQuery.builder()
-                .query(request.getQuestion())
+                .query(rewritten)
                 .dataset(ragProperties.getDataset())
                 .embeddingModel(ragProperties.getEmbeddingModel())
                 .topK(ragProperties.getTopK())
@@ -108,6 +112,7 @@ public class RagQueryService {
                 .hitCount(result.getHits() == null ? 0 : result.getHits().size())
                 .degraded(degraded)
                 .cached(false)
+                .rewrittenQuery(rewritten)
                 .build();
         answerCache.put(cacheKey, ragAnswer);
         return ragAnswer;

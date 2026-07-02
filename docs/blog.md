@@ -188,8 +188,29 @@ documentId 用文件名确定性派生（`UUID.nameUUIDFromBytes`），重启幂
 
 标准 13 步链路（鉴权→租户→缓存→改写→embedding→混合召回→权限过滤→重排→组装→生成→引用→缓存）。demo 主链覆盖检索/重排/组装/生成/引用/缓存。
 
-### 11.1 Query Rewrite
-⚠️ **诚实：ai4j 当前不提供开箱 Query Rewrite 组件。** 应用层自实现（`IMessagesService` 调一次 LLM 改写，或规则归一化）。这是 ai4j 真实缺口之一。
+### 11.1 Query Rewrite（demo 实装：QueryRewriteService）
+
+用户原始问题常很短或口语化（"退款怎么弄"），直接 embedding 语义不足。demo 的 `QueryRewriteService` 用 GLM 把口语改写为适合检索的正式表达：
+
+```java
+public String rewrite(String query) throws Exception {
+    AnthropicChatCompletion req = new AnthropicChatCompletion();
+    req.setModel(ragProperties.getGlmModel());
+    req.setSystem("你是企业电商知识库的查询改写器。把口语化问题改写为一句适合向量检索的正式表达："
+            + "1) 不改变原意；2) 补足业务主语和动作；3) 对齐知识库正式术语；4) 只输出一句话。");
+    req.setMessages(Collections.singletonList(new AnthropicMessage("user", query)));
+    req.setMaxTokens(128);
+    return extractText(messagesService.messages(req)).trim();
+}
+```
+
+`RagQueryService` 主链在检索前先改写，并把改写前后都暴露在 `RagAnswer.rewrittenQuery`。**实测效果**（见 18.7）：
+
+| 原始（口语） | 改写后（正式） |
+|---|---|
+| 退款怎么弄 | 退款操作流程 |
+
+改写后精准命中 `refund-rules.md`。生产里高频问题可叠一层规则归一化 + 改写结果缓存（避免每次 LLM 调用）。
 
 ### 11.2 混合召回与重排
 - **`HybridRetriever`**：多 retriever（Dense 向量 + Bm25 关键词）结果用 `FusionStrategy`（RRF 最常用）融合，每个 hit 带 `RagScoreDetail`（哪个 retriever 贡献多少）。`Bm25Retriever` 是纯内存实现（构造时建倒排），不需要 ES——demo 评估端点用它。
@@ -475,7 +496,7 @@ premium 租户能看到 `marketing.md`（秒杀不叠加券）+ `merchant.md`（
 
 **ai4j 当前真实不足（诚实，demo 都绕过或自补了）**：
 
-1. **Query Rewrite 无开箱组件**——应用层自写（LLM 改写/规则归一化）
+1. **Query Rewrite**：demo 已实装（`QueryRewriteService`，GLM 改写，实测"退款怎么弄"→"退款操作流程"）；ai4j core 暂未提供统一 `QueryRewriter` 接口（按需补，当前应用层几十行即可）
 2. **RAG 链路缓存无**（有意）——失效/key 维度强业务相关，留给应用层（demo 用 Caffeine）
 3. ~~RAG-as-Agent-Tool 无现成封装~~ **已解决（ai4j 2.4.0）**：`RagTool`（PR #172）+ `AgentBuilder.capture()` 让 RAG 作为 agent tool 接入统一可观测链路
 4. **Ollama 无 `/api/rerank` 端点**——`OllamaRerankService` 在 Ollama 上 404，本地 rerank 要用 LlmReranker 兜底或接 cloud（Jina/Doubao）

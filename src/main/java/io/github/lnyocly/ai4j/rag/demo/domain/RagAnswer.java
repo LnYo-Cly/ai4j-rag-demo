@@ -23,4 +23,7 @@ public class RagAnswer {
 
     /** 是否命中答案缓存。 */
     private boolean cached;
+
+    /** 查询改写后的表达（Query Rewrite，展示改写前后对比）。 */
+    private String rewrittenQuery;
 }
