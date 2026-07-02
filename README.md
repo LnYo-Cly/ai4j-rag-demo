@@ -86,6 +86,18 @@ curl -X POST http://localhost:8080/api/rag/ask \
 }
 ```
 
+### 走 agent 端点（RAG 作为 agent tool + 统一可观测）
+
+`/api/agent/ask` 用 ai4j 的 `RagTool` 把 RAG 接成 agent tool，agent 自主决定何时检索；检索作为 TOOL 节点被 `.capture(IoCaptureSink)` 捕获，整链（思考 + 检索 + 生成）统一可观测/可重放/可审计：
+
+```bash
+curl -X POST http://localhost:8080/api/agent/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "秒杀商品签收后还能申请退款吗？", "tenantId": "default"}'
+```
+
+返回里的 `capturedNodes` 含 `MODEL`（思考/生成）+ `TOOL`（RAG 检索）节点——证明 RAG 接入了 agent 的可观测链路（需 ai4j-agent 2.4.0+，含 `RagTool`）。
+
 ## 换自己的知识
 
 把 `src/main/resources/knowledge/*.md` 换成你的文档，重启即可（documentId 按文件名确定性派生，重启幂等不重复）。
