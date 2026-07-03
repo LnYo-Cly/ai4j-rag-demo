@@ -251,19 +251,69 @@ private Reranker resolveReranker(AiService aiService) {
 
 > **实践建议**：先 `none` 跑通，用 `RagEvaluator` 量 Recall@K / MRR / NDCG（见 13.6 / 18.3）。指标达标就别上 reranker（省成本）；不达标再开 jina/llm，再量一次看提升值不值这次模型调用的代价。**让数据决定，别拍脑袋。**
 
-## 十二、PgVector 索引设计
+## 十二、PgVector 索引设计：把过滤前置到召回之前
+
+PgVector 是这套架构的检索地基。它的设计决定了召回质量、并发能力、以及多租户隔离的实现方式。
+
+### 12.1 表结构（demo 实际）
 
 ```sql
 CREATE TABLE ai4j_rag_demo (
-  id text PRIMARY KEY,           -- chunkId = documentId#chunk-N
-  dataset text,                  -- 知识库边界/版本
-  content text,
-  metadata jsonb,                -- permissionTag/sourceName/sectionTitle/...
-  embedding vector(1024)
+  id text PRIMARY KEY,           -- chunkId = documentId#chunk-N（确定性派生，幂等 upsert）
+  dataset text,                  -- 知识库边界/版本（ecommerce-kb / ecommerce-kb-v2）
+  content text,                  -- chunk 正文
+  metadata jsonb,                -- permissionTag/sourceName/sectionTitle/pageNumber/...
+  embedding vector(1024)         -- Qwen3-Embedding 输出维度
 );
-CREATE INDEX ... USING hnsw (embedding vector_cosine_ops);
 ```
-真实查询"先限定租户/权限再 KNN"——PgVector 把过滤用 SQL where 和 KNN 在一条 SQL 完成，**先过滤再检索**，从根上避免越权召回。
+
+设计要点：
+- **`id` 用确定性派生的 chunkId**（`UUID.nameUUIDFromBytes(filename)#chunk-N`）——重启摄入幂等（PgVector `ON CONFLICT DO UPDATE`），不会重复累积。
+- **`dataset` 列**——天然支持版本化（双 dataset 并行 + 原子切换，见 10.3）和多知识库隔离。
+- **`metadata jsonb`**——ai4j 的 `RagMetadataKeys`（documentId/sourceName/sectionTitle/pageNumber/permissionTag…）全存这里，供过滤和引用溯源。
+
+### 12.2 HNSW 还是 IVFFlat（取舍）
+
+| | HNSW | IVFFlat |
+|---|---|---|
+| 原理 | 图近似最近邻 | 倒排 + 精确 |
+| 查询 | 快（近似） | 精度高 |
+| 建索引 | 慢、占内存多 | 快 |
+| 适合 | 中大规模（10 万~百万 chunk） | 小规模、精度优先 |
+
+demo 用 HNSW（企业 RAG 中大规模首选）：
+
+```sql
+CREATE INDEX ai4j_rag_demo_emb_idx
+  ON ai4j_rag_demo USING hnsw (embedding vector_cosine_ops);
+```
+
+`vector_cosine_ops` 是距离操作符（对应 cosine `<=>`）。用 L2 则 `vector_l2_ops`、内积 `vector_ip_ops`——**必须和查询的距离操作符一致**，否则索引用不上（退化全表扫描，这是新手最常踩的坑）。
+
+### 12.3 维度怎么选
+
+维度不是越高越好——高维度单向量内存大、索引慢、传输贵。Qwen3-Embedding-0.6B 输出 1024 维，是精度与成本的平衡点。建表 `vector(1024)` 要和 embedding 模型输出**严格一致**，否则插入报错。部分模型支持 Matryoshka（可降维 1024→512→256，精度换成本），如需降维在 embedding 调用层处理。
+
+### 12.4 过滤前置：PgVector 的杀手锏
+
+这是 PgVector 相对专用向量库的最大优势。专用向量库的过滤往往是"先 KNN 再过滤"或独立 filter DSL；PgVector 把过滤用 SQL `where` 和 KNN 在**一条 SQL** 完成——**先过滤再检索**：
+
+```sql
+SELECT id, content, embedding <=> $1 AS distance
+FROM ai4j_rag_demo
+WHERE dataset = 'ecommerce-kb'
+  AND metadata->>'permissionTag' IN ('public', 'premium')  -- 先过滤
+ORDER BY embedding <=> $1                                     -- 再 KNN
+LIMIT 5;
+```
+
+ai4j 的 `VectorSearchRequest.filter` + `RagQuery.dataset` 就是翻译成这个 where。价值：**多租户越权从召回阶段就杜绝**（15.2 实测 default 看不到 premium），不是事后遮罩。高频过滤字段（tenant/version/permission）可加 btree/gi 索引加速过滤。
+
+### 12.5 索引维护（生产）
+
+- **版本化**：用 `dataset` 列隔离版本（v1 active / v2 staging），不直接覆盖线上
+- **重建**：知识大批量更新时，建新 dataset → 重建 → 原子切换（改配置 `dataset=ecommerce-kb-v2`）
+- **HNSW 参数调优**：`m`（连边数，高精度高内存）、`ef_construction`（建索引质量）、`ef_runtime`（查询精度）——压测找平衡，别照搬默认
 
 ## 十三、生产级代码实现
 
