@@ -7,8 +7,10 @@ import io.github.lnyocly.ai4j.agent.Agents;
 import io.github.lnyocly.ai4j.agent.rag.RagTool;
 import io.github.lnyocly.ai4j.agent.replay.InMemoryIoCaptureSink;
 import io.github.lnyocly.ai4j.agent.replay.NodeIoRecord;
+import io.github.lnyocly.ai4j.agent.tool.AgentToolCall;
 import io.github.lnyocly.ai4j.agent.tool.StaticToolRegistry;
 import io.github.lnyocly.ai4j.agent.tool.ToolExecutor;
+import io.github.lnyocly.ai4j.agent.tool.TraceableToolExecutor;
 import io.github.lnyocly.ai4j.platform.openai.tool.Tool;
 import io.github.lnyocly.ai4j.rag.RagService;
 import io.github.lnyocly.ai4j.rag.demo.config.RagProperties;
@@ -75,23 +77,36 @@ public class CustomerServiceAgentController {
                 "orderId", "string", "订单号",
                 "reason", "string", "工单原因（退款/换货/投诉等）");
 
-        // 合并三个 tool 的执行器（按 tool name 分发）
-        ToolExecutor merged = call -> {
-            String name = call.getName();
-            String args = call.getArguments();
-            JSONObject arg = (args == null || args.trim().isEmpty())
-                    ? new JSONObject() : JSON.parseObject(args);
-            if ("knowledge_search".equals(name)) {
-                return knowledgeTool.executor().execute(call);
+        // 合并三个 tool 的执行器（按 tool name 分发）；实现 TraceableToolExecutor 以便把
+        // knowledge_search 的 RAG sub-trace（RagResult）透出给 IoCapture
+        final ToolExecutor knowledgeExec = knowledgeTool.executor();
+        ToolExecutor merged = new TraceableToolExecutor() {
+            private final ThreadLocal<String> lastName = new ThreadLocal<String>();
+            @Override
+            public String execute(AgentToolCall call) throws Exception {
+                lastName.set(call.getName());
+                String name = call.getName();
+                String args = call.getArguments();
+                JSONObject arg = (args == null || args.trim().isEmpty())
+                        ? new JSONObject() : JSON.parseObject(args);
+                if ("knowledge_search".equals(name)) {
+                    return knowledgeExec.execute(call);
+                }
+                if ("query_order".equals(name)) {
+                    return JSON.toJSONString(orderService.queryOrder(arg.getString("orderId")));
+                }
+                if ("create_ticket".equals(name)) {
+                    return JSON.toJSONString(ticketService.createTicket(
+                            arg.getString("orderId"), arg.getString("reason")));
+                }
+                return "unknown tool: " + name;
             }
-            if ("query_order".equals(name)) {
-                return JSON.toJSONString(orderService.queryOrder(arg.getString("orderId")));
+            @Override
+            public Object lastTrace() {
+                return "knowledge_search".equals(lastName.get())
+                        ? ((TraceableToolExecutor) knowledgeExec).lastTrace()
+                        : null;
             }
-            if ("create_ticket".equals(name)) {
-                return JSON.toJSONString(ticketService.createTicket(
-                        arg.getString("orderId"), arg.getString("reason")));
-            }
-            return "unknown tool: " + name;
         };
 
         // 客服 agent：自主编排（开 thinking，验证 reasoningText 捕获）
