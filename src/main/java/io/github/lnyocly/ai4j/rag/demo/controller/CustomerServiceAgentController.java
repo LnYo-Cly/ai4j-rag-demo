@@ -131,6 +131,10 @@ public class CustomerServiceAgentController {
             n.put("latencyFromStartMs", ts - firstTs);          // 距首个节点（累计时间线）
             n.put("input", JSON.toJSONString(rec.getInputs()));   // 完整 input，不截断
             n.put("output", JSON.toJSONString(rec.getOutputs())); // 完整 output，不截断
+            n.put("reasoningText", rec.getReasoningText());       // MODEL 思维链（GLM thinking，TOOL 为 null）
+            n.put("retryCount", rec.getRetryCount());             // MODEL 重试次数（MODEL_RETRY 计数）
+            n.put("inputTokens", rec.getInputTokens());           // MODEL 输入 token（成本核算，从 usage 解析）
+            n.put("outputTokens", rec.getOutputTokens());         // MODEL 输出 token（成本核算，从 usage 解析）
             capturedNodes.add(n);
             prevTs = ts;
             if (rec.getNodeType() == NodeIoRecord.NodeType.MODEL) {
