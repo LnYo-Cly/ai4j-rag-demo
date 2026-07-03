@@ -578,9 +578,52 @@ STEP 6  answer       : 根据参考资料，退款操作流程如下：1. 发起
 8. **Ollama 无 `/api/rerank`** → 用 LlmReranker 兜底，或接 cloud rerank
 
 ## 二十、演进
+
+**基础设施演进**：
 - 知识量涨 → PgVector→Milvus/Qdrant（`VectorStore` 不变）
 - 复杂检索 → `HybridRetriever` 接 ES 做 `Bm25Retriever`
-- 单问答→智能体 → ai4j-agent（ReAct+工具+记忆+compaction）；RAG 通过 `RagTool`（ai4j PR #172）作为 agent tool 接入，自动进 agent 可观测链路（重放/恢复/审计），不再割裂
+
+### 20.1 从 RAG 问答到电商客服 agent（把整条链路串起来）
+
+demo 的 `/api/agent/ask` 已经展示了 RAG 作为**单个 tool** 接入 agent（`RagTool` + `.capture()`）。但真正的电商客服远不止"查知识库"——用户问"我昨天下的单什么时候到，不想要了能退吗"，客服 agent 要**串联多个能力**：查订单 tool（订单状态/物流）+ 检索知识 tool（退款规则）+ 可能的创建工单 tool。
+
+这就是 RAG"在 agent 里用"的完整形态——RAG 不再是独立链路，而是 agent 的一个能力模块，和业务 tool 平级。用 ai4j 这样搭：
+
+```java
+// ① 知识检索 tool（RAG）
+RagTool knowledgeTool = RagTool.builder(ragService)
+        .dataset("ecommerce-kb").embeddingModel("...").topK(5).build();
+
+// ② 订单查询 tool（接业务系统）
+Tool orderTool = Tool.function("query_order", "查订单状态/物流", orderParams);
+ToolExecutor orderExecutor = call -> orderService.query(extract(call, "orderId"));
+
+// ③ 创建工单 tool
+Tool ticketTool = Tool.function("create_ticket", "为用户创建售后工单", ticketParams);
+ToolExecutor ticketExecutor = call -> ticketService.create(...);
+
+// 客服 agent：自主编排这三个能力
+Agent customerService = Agents.react().anthropicMessages(key, baseUrl).model("glm-4.6")
+        .system("你是电商客服。根据用户问题，自主决定查订单、查知识库、或建工单。")
+        .toolRegistry(new StaticToolRegistry(Arrays.asList(
+                knowledgeTool.tool(), orderTool, ticketTool)))
+        .toolExecutor(merge(knowledgeTool.executor(), orderExecutor, ticketExecutor))
+        .capture(new InMemoryIoCaptureSink())   // 整条客服链路（思考+多tool）全捕获
+        .build();
+
+AgentResult r = customerService.newSession().run("我昨天下的单什么时候到，不想要了能退吗？");
+// agent 自主：query_order 查物流 → knowledge_search 查退款规则 → 综合回答（必要时 create_ticket）
+```
+
+**这套架构的威力**：
+- **自主编排**：用户一句话，agent 决定调哪些 tool、什么顺序，不用硬编码 if/else 流程
+- **RAG 是其中一个 tool**，和业务 tool 平级——RAG 的可观测**自动融进** agent 的 `IoCaptureSink`（不再有"RAG trace vs agent trace 割裂"）
+- **整条客服链路可重放/恢复/审计**：哪个 tool 出错、哪步决策错，capture 里一目了然
+
+这就是本文反复强调的"RAG 在哪都能用、agent 里也能接入"的落地形态：
+- `/api/rag/ask` —— RAG 独立用（per-step trace，排障检索质量）
+- `/api/agent/ask` —— RAG 进 agent（统一 capture，单 tool 场景）
+- **客服 agent**（本节）—— RAG + 多 tool 的完整生产形态（自主编排 + 整体重放/审计）
 
 ## 二十一、生产落地检查清单
 架构（离在线解耦/版本化/接口抽象）/ 检索（过滤/chunk/rerank/拒答）/ 工程（缓存/线程池/限流熔断降级/异常演练）/ 安全（先过滤再生成/脱敏/审计）/ 观测（RagTrace 看召回排序/缓存命中/评测集）。
