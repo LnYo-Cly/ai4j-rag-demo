@@ -754,6 +754,30 @@ AgentResult r = customerService.newSession().run("我昨天下的单什么时候
 - `/api/agent/ask` —— RAG 进 agent（统一 capture，单 tool 场景）
 - **客服 agent**（本节）—— RAG + 多 tool 的完整生产形态（自主编排 + 整体重放/审计）
 
+### 20.2 真实运行（demo `/api/agent/customer-service`）
+
+用户一句话："订单 ORD-12345 什么时候到？我不想要了能退吗？"
+
+agent 自主编排（没硬编码流程）：
+
+```
+steps: 2 | toolCalls: 2          ← 自主调了 2 个 tool
+captured: total=4  MODEL=2  TOOL=2   ← 整链进 IoCaptureSink
+
+answer:
+📦 订单状态：
+- 订单 ORD-12345 已发货
+- 预计送达时间：2026年7月4日
+- 当前未签收
+
+🔍 退款情况分析：
+很抱歉，您的订单目前无法办理无理由退款，原因如下：
+- 您的订单尚未签收，根据售后政策，退款申请需在签收后7天内发起
+- 等您签收后，如果该商品非秒杀/活动商品且保持完好，可以在7天内申请无理由退款
+```
+
+agent 调了 `query_order`（查到 mock 订单：已发货/7月4日/未签收）+ `knowledge_search`（查到退款规则：签收后7天内），基于**两个 tool 的真实返回**综合回答——订单状态 + 退款政策 + 为什么现在不能退。整条链路（2 MODEL + 2 TOOL）全在 `IoCaptureSink`，可重放、可审计。
+
 ## 二十一、生产落地检查清单
 架构（离在线解耦/版本化/接口抽象）/ 检索（过滤/chunk/rerank/拒答）/ 工程（缓存/线程池/限流熔断降级/异常演练）/ 安全（先过滤再生成/脱敏/审计）/ 观测（RagTrace 看召回排序/缓存命中/评测集）。
 
