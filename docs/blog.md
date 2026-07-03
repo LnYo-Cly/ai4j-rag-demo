@@ -373,11 +373,90 @@ for (String[] c : EVAL_SET) {  // {query, 期望文件名}
 ### 13.7 生成（GLM + 拒答约束）
 system prompt 明确："若资料不足以支撑答案，请明确说明无法确认，不要编造制度、流程或时效"。这是抑制幻觉的关键。
 
-## 十四、高并发与可扩展
-真实瓶颈是组合（Rewrite 占模型/embedding 吞吐/检索连接/rerank 延迟/LLM 最慢）。治理：资源池隔离（Web/摄入/embedding/rerank/LLM 独立线程池）、Resilience4j 限流熔断降级、四层缓存（Rewrite/Embedding/Retrieval/Answer，key 带 dataset+kbVersion+permissionScope+queryHash）、横向扩展（在线无状态、状态下沉 Postgres/MQ/缓存）。
+## 十四、高并发与可扩展：RAG 上线后最容易出事的地方
 
-## 十五、多租户、安全与权限隔离
-正确顺序：`识别身份→计算可访问范围→查询附带过滤→结果再校验→生成`，不是"先全库召回再遮罩"。demo 用 `permissionTag`（public/premium）+ PgVector metadata jsonb where 前置过滤。**实测**：premium 租户问题能召回 marketing/merchant 内部规则，default 租户同样的问题**只能召回 public 文档，看不到 premium**（见十八章 Q2 vs Q3）。
+这是 demo 没直接演示（单体跑通即可）、但**生产必踩**的一块。RAG 的并发问题和普通 Web 服务不一样——它的瓶颈不是单点，是**链路组合**。
+
+### 14.1 真实瓶颈在哪（不是单点，是组合）
+
+一条 RAG 请求经过：Query Rewrite（LLM）→ embedding（模型）→ 向量检索（Postgres）→ rerank（模型，可选）→ 组装 → 生成（LLM）。每步资源特征完全不同：
+
+| 步骤 | 资源特征 | 高并发下的表现 |
+|---|---|---|
+| Query Rewrite | LLM 调用 | 占模型额度、RRT 长 |
+| embedding | 模型吞吐有限 | 排队，本地 Ollama 单卡吞吐封顶 |
+| 向量检索 | Postgres 连接 + CPU | 连接池打满、HNSW 查询 CPU 涨 |
+| rerank | 额外模型调用 | 延迟叠加（11.2 讲的成本） |
+| 生成 | LLM，最慢最贵 | P99 主要贡献者，最易抖动 |
+
+**关键认知**：生成是最慢最贵的（秒级），它决定 P99；embedding/检索是毫秒级但高频。**如果不隔离，一次生成卡住会通过池化资源拖垮整条链路**——这是 RAG 高并发事故最常见的根因。
+
+### 14.2 资源池隔离（第一道防线）
+
+至少拆分这些线程池，别让它们互相饿死：Web 请求池、摄入 worker 池（离线入库，重 CPU/IO）、embedding/rerank 池、生成池。**摄入和在线必须分池**——否则一次大批量入库会把在线问答的 embedding 挤死。demo 是单体没拆，但生产这是硬要求。
+
+### 14.3 限流 / 超时 / 熔断 / 降级（假设模型服务会抖动）
+
+生产必须假设 GLM/Ollama 会抖动（超时、限流、宕机）。治理顺序：
+1. **限流**：网关层限 RAG QPS，保护下游
+2. **每阶段独立超时**：rewrite 3s、检索 200ms、生成 2s——别只网关统一超时（统一超时会让慢的生成挤掉快的检索）
+3. **熔断**：模型连续失败时快速失败（Resilience4j `CircuitBreaker`）
+4. **降级**：检索空 → 直接 LLM 兜底（demo 的 `degraded` 标记就是这个）；rerank 失败 → 用检索原始排序；全挂 → 返回缓存答案 / FAQ
+
+demo 的 `RagAnswer.degraded` 就是降级标记——检索为空时 context 为空，生成走拒答/兜底 prompt。
+
+### 14.4 缓存（基础设施，不是优化）
+
+四层缓存，**每层 key 必须带版本维度**，否则知识更新后用户看到旧答案：
+- Rewrite 缓存（高频 query 改写复用）
+- Embedding 缓存（同 query 向量复用）
+- Retrieval 缓存（热点政策 query 的召回结果）
+- Answer 缓存（稳定问答直接返回）
+
+demo 用 Caffeine 做了 Answer 缓存（key = `tenant::originalQuestion`，实测第二次同问 `cached=true`）。生产 key 设计的要点：**带 tenant + kbVersion + permissionScope + queryHash**，不带版本就是埋雷。
+
+### 14.5 横向扩展
+
+在线问答服务**无状态化**（状态下沉到 Postgres/MQ/缓存），多副本水平扩展；摄入 worker 独立扩缩容（消息驱动）；Postgres 读写分离 / 分库（数据规模到瓶颈时）。一句话：**在线服务无状态，状态下沉**——这是横向扩展的前提。
+
+## 十五、多租户、安全与权限隔离：RAG 最危险的不是答错，是串库
+
+RAG 系统最危险的问题不是"答错"，是**"串库"**——A 租户看到 B 租户的私密知识，或者普通用户看到内部规则。这种事故的代价远高于答错一个退款问题。
+
+### 15.1 权限过滤的正确顺序（前置，不是后置）
+
+正确：`识别身份 → 计算可访问范围 → 查询时附带过滤 → 检索结果再校验 → 生成`
+错误：`先全库召回 → 生成答案 → 再遮罩/脱敏`
+
+后一种在 RAG 里**根本不生效**——敏感内容一旦进了 context，模型已经"看到"并可能反映在答案里，事后遮罩遮不住。所以必须**在召回阶段就过滤**，敏感内容压根不进 context。
+
+### 15.2 demo 的多租户实测（public/premium 越权隔离）
+
+demo 把知识分两级：`permissionTag=public`（退款/物流/售后，所有租户可见）+ `permissionTag=premium`（营销内部预算、商家保证金规则，仅 premium 租户）。摄入时写进 metadata，查询时按租户身份带 filter：
+
+```java
+private List<String> permissionTagsFor(String tenant) {
+    if ("premium".equals(tenant)) return Arrays.asList("public", "premium");
+    return Collections.singletonList("public");  // default 只看 public
+}
+// RagQuery.filter.put("permissionTag", permissionTagsFor(tenant))
+```
+
+PgVector 把这个 filter 翻译成 `metadata jsonb where`，和 KNN 在**一条 SQL** 里完成——**先过滤再检索**，从召回阶段就隔离。
+
+**实测对比**（同一个问题"秒杀价格能和优惠券叠加吗"，见 18.2）：
+- **premium 租户** → 召回 `marketing.md` + `merchant.md`（内部规则）+ public → 能答出"秒杀价不叠加券、商家违规扣保证金"
+- **default 租户** → 召回**只有 public**（refund/after-sales/logistics），marketing/merchant **压根不在结果里** → 答不出内部规则
+
+这就是"前置过滤"的实证——不是事后遮罩，是召回阶段就看不到 premium 内容。
+
+### 15.3 权限模型建议
+
+每个 chunk 打权限标签（如 `public/employee/customer-service/merchant/finance-admin`），用户进系统映射成 `AccessScope(tenantId, permissionTags)`，检索层召回前过滤。召回结果还可以再校验一遍（防 SDK bug / 配置错误）——多一道防线。
+
+### 15.4 敏感信息脱敏（第二层保护，不等于权限隔离）
+
+回传给模型的 context 里如果有手机号/身份证/银行卡，建议脱敏。但注意：**脱敏是第二层保护**，不能替代 15.1 的权限前置过滤——脱敏防的是"无意泄露"，权限过滤防的是"越权访问"，两个层面。
 
 ## 十六、可观测性：让一次请求的每一步都看得见
 
