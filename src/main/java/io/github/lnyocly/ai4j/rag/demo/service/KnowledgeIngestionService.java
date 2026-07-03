@@ -6,6 +6,7 @@ import io.github.lnyocly.ai4j.rag.demo.config.RagProperties;
 import io.github.lnyocly.ai4j.rag.ingestion.IngestionPipeline;
 import io.github.lnyocly.ai4j.rag.ingestion.IngestionRequest;
 import io.github.lnyocly.ai4j.rag.ingestion.IngestionResult;
+import io.github.lnyocly.ai4j.rag.ingestion.IngestionTrace;
 import io.github.lnyocly.ai4j.rag.ingestion.IngestionSource;
 import io.github.lnyocly.ai4j.service.PlatformType;
 import io.github.lnyocly.ai4j.service.factory.AiService;
@@ -85,7 +86,14 @@ public class KnowledgeIngestionService {
                 }
             }
             total += result.getUpsertedCount();
-            log.info("Ingested [{}] {}: {} chunks", permissionTag, resource.getFilename(), result.getUpsertedCount());
+            IngestionTrace t = result.getTrace();
+            log.info("Ingested [{}] {}: {} chunks | load={}ms chunk={}ms embed={}ms upsert={}ms total={}ms",
+                    permissionTag, resource.getFilename(), result.getUpsertedCount(),
+                    t == null ? 0 : t.getLoadDurationMs(),
+                    t == null ? 0 : t.getChunkDurationMs(),
+                    t == null ? 0 : t.getEmbedDurationMs(),
+                    t == null ? 0 : t.getUpsertDurationMs(),
+                    t == null ? 0 : t.getTotalDurationMs());
         }
         return total;
     }
