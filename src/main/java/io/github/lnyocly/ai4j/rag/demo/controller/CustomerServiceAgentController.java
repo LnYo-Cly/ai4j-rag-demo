@@ -113,24 +113,30 @@ public class CustomerServiceAgentController {
         io.github.lnyocly.ai4j.agent.AgentResult result =
                 agent.newSession().run(request.getQuestion());
 
-        // 展平捕获节点
+        // 展平捕获节点：完整 input/output + latency + step 因果（合格 trace 该有的）
+        List<NodeIoRecord> records = sink.records();
         List<Map<String, Object>> capturedNodes = new ArrayList<Map<String, Object>>();
         int modelNodes = 0, toolNodes = 0;
-        List<String> toolNames = new ArrayList<String>();
-        for (NodeIoRecord rec : sink.records()) {
+        long firstTs = records.isEmpty() ? 0L : records.get(0).getCapturedAtEpochMs();
+        long prevTs = firstTs;
+        for (int idx = 0; idx < records.size(); idx++) {
+            NodeIoRecord rec = records.get(idx);
+            long ts = rec.getCapturedAtEpochMs();
             Map<String, Object> n = new LinkedHashMap<String, Object>();
+            n.put("seq", idx);
             n.put("nodeType", rec.getNodeType());
             n.put("step", rec.getStep());
-            // 暴露实际 input/output 内容（摘要）——这才是 trace 的排查价值：
-            // MODEL 节点的 prompt/response、TOOL 节点的调用参数/返回结果，一眼定位哪一环出问题
-            n.put("input", truncate(JSON.toJSONString(rec.getInputs()), 500));
-            n.put("output", truncate(JSON.toJSONString(rec.getOutputs()), 500));
+            n.put("turnId", rec.getTurnId());
+            n.put("durationMs", rec.getDurationMs());            // per-node 精准执行耗时（startedAt → capturedAt）
+            n.put("latencyFromStartMs", ts - firstTs);          // 距首个节点（累计时间线）
+            n.put("input", JSON.toJSONString(rec.getInputs()));   // 完整 input，不截断
+            n.put("output", JSON.toJSONString(rec.getOutputs())); // 完整 output，不截断
             capturedNodes.add(n);
+            prevTs = ts;
             if (rec.getNodeType() == NodeIoRecord.NodeType.MODEL) {
                 modelNodes++;
             } else {
                 toolNodes++;
-                toolNames.add(rec.getNodeId());
             }
         }
 
