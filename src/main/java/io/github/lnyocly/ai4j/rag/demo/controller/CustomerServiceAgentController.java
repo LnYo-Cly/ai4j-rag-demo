@@ -94,11 +94,15 @@ public class CustomerServiceAgentController {
             return "unknown tool: " + name;
         };
 
-        // 客服 agent：自主编排
+        // 客服 agent：自主编排（开 thinking，验证 reasoningText 捕获）
+        Map<String, Object> thinkingCfg = new HashMap<String, Object>();
+        thinkingCfg.put("type", "enabled");
+        thinkingCfg.put("budget_tokens", 1024);
         Agent agent = Agents.react()
                 .anthropicMessages(glmKey, glmBaseUrl)
                 .model(ragProperties.getGlmModel())
-                .maxOutputTokens(1024)
+                .maxOutputTokens(2048)
+                .reasoning(thinkingCfg)
                 .systemPrompt("你是电商客服助手。根据用户问题自主决定调用哪个工具：\n"
                         + "- query_order：查订单状态/物流（用户给了订单号时）\n"
                         + "- knowledge_search：查知识库（退款规则、售后政策、物流时效等）\n"
