@@ -778,6 +778,36 @@ answer:
 
 agent 调了 `query_order`（查到 mock 订单：已发货/7月4日/未签收）+ `knowledge_search`（查到退款规则：签收后7天内），基于**两个 tool 的真实返回**综合回答——订单状态 + 退款政策 + 为什么现在不能退。整条链路（2 MODEL + 2 TOOL）全在 `IoCaptureSink`，可重放、可审计。
 
+### 20.3 trace 的真正价值：每个节点的 input/output 都看得见
+
+光说"捕获了 4 个节点"不够——trace 的价值在于**每个节点的实际 input/output 内容都可见**，排查时精准定位"哪一环不足"。demo 的 `capturedNodes` 把每步的 input/output 都序列化暴露了。上面那次客服请求的完整 trace：
+
+```
+NODE TOOL  step=0  (query_order)
+  input : {"arguments":"{\"orderId\":\"ORD-12345\"}","name":"query_order"}     ← 调用参数对不对？
+  output: {"output":"{\"status\":\"shipped\",\"logistics\":\"已发货,预计2026-07-04送达\",\"signedAt\":\"未签收\"}"}
+
+NODE TOOL  step=0  (knowledge_search = RAG 检索)
+  input : {"arguments":"{\"query\":\"退款规则和退款流程\"}","name":"knowledge_search"}  ← RAG query 对不对？
+  output: {"output":"[S1] refund-rules.md\n# 退款规则\n## 退款申请时效\n用户在订单签收后7天内..."}  ← 召回对不对？
+
+NODE MODEL step=0  (第一次决策)
+  input : [...user: 订单ORD-12345什么时候到？我不想要了能退吗？...]
+  output: [text:"我来帮您查询订单信息。", tool_use:query_order, tool_use:knowledge_search]  ← 决策调了2个tool
+
+NODE MODEL step=1  (最终生成)
+  input : [...user + assistant(tool_calls) + tool_results...]                  ← 含tool结果的prompt
+  output: [text:"根据订单查询结果,📦订单状态...已发货/未签收...退款需签收后7天内..."]
+```
+
+**这就是 trace 优势的落地**——假设这个客服 case 答错了，你逐节点质疑：
+- TOOL `query_order`：参数对不对（orderId 传对没）？返回对不对（订单系统数据准没）？
+- TOOL `knowledge_search`：RAG 检索的 query 对不对（改写/原始）？召回的 chunk 对不对（refund-rules 进了没）？
+- MODEL step0：第一次决策对不对（该调哪些 tool、顺序对没）？
+- MODEL step1：最终生成对不对（有没有基于 tool 结果、有没有幻觉）？
+
+**每一环都能单独审视，精准定位不足**——这就是可观测系统对 agent 的价值，也是 `IoCaptureSink` 的意义（还能重放、从失败点恢复、审计）。
+
 ## 二十一、生产落地检查清单
 架构（离在线解耦/版本化/接口抽象）/ 检索（过滤/chunk/rerank/拒答）/ 工程（缓存/线程池/限流熔断降级/异常演练）/ 安全（先过滤再生成/脱敏/审计）/ 观测（RagTrace 看召回排序/缓存命中/评测集）。
 

@@ -121,8 +121,10 @@ public class CustomerServiceAgentController {
             Map<String, Object> n = new LinkedHashMap<String, Object>();
             n.put("nodeType", rec.getNodeType());
             n.put("step", rec.getStep());
-            n.put("hasInput", rec.getInputs() != null);
-            n.put("hasOutput", rec.getOutputs() != null);
+            // 暴露实际 input/output 内容（摘要）——这才是 trace 的排查价值：
+            // MODEL 节点的 prompt/response、TOOL 节点的调用参数/返回结果，一眼定位哪一环出问题
+            n.put("input", truncate(JSON.toJSONString(rec.getInputs()), 500));
+            n.put("output", truncate(JSON.toJSONString(rec.getOutputs()), 500));
             capturedNodes.add(n);
             if (rec.getNodeType() == NodeIoRecord.NodeType.MODEL) {
                 modelNodes++;
@@ -143,6 +145,11 @@ public class CustomerServiceAgentController {
         resp.put("capturedToolNodes", toolNodes);
         resp.put("capturedNodes", capturedNodes);
         return resp;
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) return null;
+        return s.length() > max ? s.substring(0, max) + "..." : s;
     }
 
     private Tool makeTool(String name, String desc, String paramName, String paramType, String paramDesc) {
