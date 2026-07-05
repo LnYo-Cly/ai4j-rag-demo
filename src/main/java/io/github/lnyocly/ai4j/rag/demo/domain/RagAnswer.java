@@ -43,4 +43,13 @@ public class RagAnswer {
 
     /** Query Planning 耗时（毫秒，planner 开时填）。 */
     private long planningDurationMs;
+
+    /** 召回耗时（含 query embedding / KNN / pre-filter）。 */
+    private long retrieveDurationMs;
+    /** 重排耗时（jina 1 次 API；llm 时含 N 次 GLM 打分，成本 proxy）。 */
+    private long rerankDurationMs;
+    /** 上下文组装耗时。 */
+    private long assembleDurationMs;
+    /** search 总耗时（planning + retrieve + rerank + assemble）。 */
+    private long totalDurationMs;
 }

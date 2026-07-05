@@ -173,6 +173,10 @@ public class RagQueryService {
                     .context(context)
                     .queryPlan(trace != null ? trace.getQueryPlan() : null)
                     .planningDurationMs(trace != null ? trace.getPlanningDurationMs() : 0L)
+                    .retrieveDurationMs(trace != null ? trace.getRetrieveDurationMs() : 0L)
+                    .rerankDurationMs(trace != null ? trace.getRerankDurationMs() : 0L)
+                    .assembleDurationMs(trace != null ? trace.getAssembleDurationMs() : 0L)
+                    .totalDurationMs(trace != null ? trace.getTotalDurationMs() : 0L)
                     .build();
             answerCache.put(cacheKey, ragAnswer);
             return ragAnswer;
