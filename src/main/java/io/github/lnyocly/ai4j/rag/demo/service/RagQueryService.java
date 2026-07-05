@@ -13,6 +13,7 @@ import io.github.lnyocly.ai4j.rag.DefaultRagService;
 import io.github.lnyocly.ai4j.rag.DenseRetriever;
 import io.github.lnyocly.ai4j.rag.RagCitation;
 import io.github.lnyocly.ai4j.rag.RagHit;
+import io.github.lnyocly.ai4j.rag.RagQueryPlanner;
 import io.github.lnyocly.ai4j.rag.RagQuery;
 import io.github.lnyocly.ai4j.rag.RagResult;
 import io.github.lnyocly.ai4j.rag.RagService;
@@ -60,10 +61,15 @@ public class RagQueryService {
                            QueryRewriteService queryRewriteService) {
         this.ragProperties = ragProperties;
         this.messagesService = aiService.getMessagesService(PlatformType.ANTHROPIC);
+        RagQueryPlanner planner = ragProperties.isPlannerEnabled()
+                ? aiService.getModelRagQueryPlanner(PlatformType.ANTHROPIC, ragProperties.getGlmModel(),
+                        null, ragProperties.getPlannerMaxVariants(), true)
+                : null;
         this.ragService = new DefaultRagService(
                 new DenseRetriever(aiService.getEmbeddingService(PlatformType.OLLAMA), vectorStore),
                 resolveReranker(aiService),
-                new DefaultRagContextAssembler());
+                new DefaultRagContextAssembler(),
+                planner);
         this.answerCache = Caffeine.newBuilder()
                 .maximumSize(1000)
                 .expireAfterWrite(10, TimeUnit.MINUTES)
@@ -85,8 +91,10 @@ public class RagQueryService {
             Map<String, Object> filter = new LinkedHashMap<String, Object>();
             filter.put("permissionTag", permissionTagsFor(request.getTenantId()));
 
-            // ② Query Rewrite：口语 → 正式术语
-            String rewritten = queryRewriteService.rewrite(request.getQuestion());
+            // ② Query Rewrite（planner 关时）；planner 开时由 RagService 内部 plan 生成 variants，跳 rewrite 避免重复
+            String rewritten = ragProperties.isPlannerEnabled()
+                    ? request.getQuestion()
+                    : queryRewriteService.rewrite(request.getQuestion());
 
             // ③ 检索 + ④ 重排（RagService 内部），开 trace 拿到 retrieved/reranked 两份顺序
             RagQuery query = RagQuery.builder()
@@ -137,6 +145,8 @@ public class RagQueryService {
                     .retrievedHits(retrievedHits)
                     .rerankedHits(rerankedHits)
                     .context(context)
+                    .queryPlan(trace != null ? trace.getQueryPlan() : null)
+                    .planningDurationMs(trace != null ? trace.getPlanningDurationMs() : 0L)
                     .build();
             answerCache.put(cacheKey, ragAnswer);
             return ragAnswer;

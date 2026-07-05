@@ -32,4 +32,10 @@ public class RagProperties {
 
     /** Jina rerank 模型（reranker=jina 时用）。 */
     private String jinaRerankModel = "jina-reranker-v2-base-multilingual";
+
+    /** 是否启用 Query Planning（ModelRagQueryPlanner：GLM 生成 query variants 多路召回融合，替代 QueryRewriteService）。 */
+    private boolean plannerEnabled = false;
+
+    /** Query Planning 最大 variant 数（planner-enabled=true 时生效）。 */
+    private int plannerMaxVariants = 3;
 }

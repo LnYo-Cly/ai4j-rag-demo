@@ -37,4 +37,10 @@ public class RagAnswer {
     private List<Map<String, Object>> rerankedHits;
     /** 组装给模型的上下文（带 [S1][S2] 引用标记）。 */
     private String context;
+
+    /** Query Planning 结果（variants + fallback，planner 开时填；来自 SDK RagTrace.queryPlan）。 */
+    private io.github.lnyocly.ai4j.rag.RagQueryPlan queryPlan;
+
+    /** Query Planning 耗时（毫秒，planner 开时填）。 */
+    private long planningDurationMs;
 }

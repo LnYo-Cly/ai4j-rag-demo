@@ -38,3 +38,5 @@ rag:
   top-k: 5
   reranker: llm  # none（不重排，靠混合检索排序）/ jina（专用 rerank 模型）/ llm（GLM 打分兜底）
   jina-rerank-model: jina-reranker-v2-base-multilingual
+  planner-enabled: true  # true 开启 Query Planning（GLM 生成 query variants 多路召回融合，替代 QueryRewriteService）
+  planner-max-variants: 3
