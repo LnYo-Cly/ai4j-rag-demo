@@ -10,8 +10,13 @@ import io.github.lnyocly.ai4j.rag.DefaultRagContextAssembler;
 import io.github.lnyocly.ai4j.rag.NoopReranker;
 import io.github.lnyocly.ai4j.rag.Reranker;
 import io.github.lnyocly.ai4j.rag.DefaultRagService;
+import io.github.lnyocly.ai4j.rag.Bm25Retriever;
 import io.github.lnyocly.ai4j.rag.DenseRetriever;
+import io.github.lnyocly.ai4j.rag.HybridRetriever;
+import io.github.lnyocly.ai4j.rag.RagContextAssembler;
 import io.github.lnyocly.ai4j.rag.RagCitation;
+import io.github.lnyocly.ai4j.rag.Retriever;
+import io.github.lnyocly.ai4j.rag.RrfFusionStrategy;
 import io.github.lnyocly.ai4j.rag.RagHit;
 import io.github.lnyocly.ai4j.rag.RagQueryPlanner;
 import io.github.lnyocly.ai4j.rag.RagQuery;
@@ -53,29 +58,50 @@ public class RagQueryService {
 
     private final RagProperties ragProperties;
     private final IMessagesService messagesService;
-    private final RagService ragService;
     private final Cache<String, RagAnswer> answerCache;
     private final QueryRewriteService queryRewriteService;
+    private final DenseRetriever denseRetriever;
+    private final Reranker reranker;
+    private final RagContextAssembler contextAssembler;
+    private final RagQueryPlanner planner;
+    private final InMemoryCorpus inMemoryCorpus;
 
     public RagQueryService(AiService aiService, PgVectorStore vectorStore, RagProperties ragProperties,
-                           QueryRewriteService queryRewriteService) {
+                           QueryRewriteService queryRewriteService, InMemoryCorpus inMemoryCorpus) {
         this.ragProperties = ragProperties;
         this.messagesService = aiService.getMessagesService(PlatformType.ANTHROPIC);
-        RagQueryPlanner planner = ragProperties.isPlannerEnabled()
+        this.queryRewriteService = queryRewriteService;
+        this.inMemoryCorpus = inMemoryCorpus;
+        this.denseRetriever = new DenseRetriever(aiService.getEmbeddingService(PlatformType.OLLAMA), vectorStore);
+        this.reranker = resolveReranker(aiService);
+        this.contextAssembler = new DefaultRagContextAssembler();
+        this.planner = ragProperties.isPlannerEnabled()
                 ? aiService.getModelRagQueryPlanner(PlatformType.ANTHROPIC, ragProperties.getGlmModel(),
                         null, ragProperties.getPlannerMaxVariants(), true)
                 : null;
-        this.ragService = new DefaultRagService(
-                new DenseRetriever(aiService.getEmbeddingService(PlatformType.OLLAMA), vectorStore),
-                resolveReranker(aiService),
-                new DefaultRagContextAssembler(),
-                planner);
         this.answerCache = Caffeine.newBuilder()
                 .maximumSize(1000)
                 .expireAfterWrite(10, TimeUnit.MINUTES)
                 .recordStats()
                 .build();
-        this.queryRewriteService = queryRewriteService;
+    }
+
+    /**
+     * 构造本次请求的 RagService：hybrid-enabled 且 BM25 corpus 非空时用 Hybrid(Dense+BM25+RRF)，
+     * 否则纯 Dense。per-request 构造是因为 InMemoryCorpus 在 ApplicationRunner 阶段才填，
+     * 单例 BM25 会卡在 startup 空 corpus。BM25 用 publicCorpus（premium 不进 BM25，多租户不泄漏）。
+     */
+    private RagService buildRagService() {
+        Retriever retriever = this.denseRetriever;
+        if (ragProperties.isHybridEnabled()) {
+            List<RagHit> corpus = inMemoryCorpus.publicCorpus();
+            if (!corpus.isEmpty()) {
+                retriever = new HybridRetriever(
+                        Arrays.asList(denseRetriever, new Bm25Retriever(corpus)),
+                        new RrfFusionStrategy());
+            }
+        }
+        return new DefaultRagService(retriever, reranker, contextAssembler, planner);
     }
 
     public RagAnswer ask(ChatRequest request) {
@@ -105,7 +131,7 @@ public class RagQueryService {
                     .filter(filter)
                     .includeTrace(Boolean.TRUE)
                     .build();
-            RagResult result = ragService.search(query);
+            RagResult result = buildRagService().search(query);
 
             // ⑤ 上下文组装（带 [S1][S2] 引用标记）
             String context = result.getContext() == null ? "" : result.getContext();

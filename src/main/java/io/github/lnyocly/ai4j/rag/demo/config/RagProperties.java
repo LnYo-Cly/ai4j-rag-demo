@@ -38,4 +38,7 @@ public class RagProperties {
 
     /** Query Planning 最大 variant 数（planner-enabled=true 时生效）。 */
     private int plannerMaxVariants = 3;
+
+    /** 是否启用 Hybrid 检索（Dense + 内存 BM25 + RRF 融合；BM25 用 public corpus，多租户不泄漏）。 */
+    private boolean hybridEnabled = false;
 }

@@ -40,3 +40,4 @@ rag:
   jina-rerank-model: jina-reranker-v2-base-multilingual
   planner-enabled: true  # true 开启 Query Planning（GLM 生成 query variants 多路召回融合，替代 QueryRewriteService）
   planner-max-variants: 3
+  hybrid-enabled: true  # true 开启 Hybrid 检索（Dense + BM25 + RRF；展示 PR #179 子路容错 best-effort）
