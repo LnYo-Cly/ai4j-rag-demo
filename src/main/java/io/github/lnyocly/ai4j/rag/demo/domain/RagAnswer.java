@@ -20,8 +20,10 @@ public class RagAnswer {
     private List<ReferenceItem> references;
     /** 本次检索命中的 chunk 数。 */
     private int hitCount;
-    /** 是否降级（检索为空时直接 LLM 兜底）。 */
+    /** 是否降级（检索为空时直接 LLM 兜底；或 RAG 链路异常时整体兜底）。 */
     private boolean degraded;
+    /** 降级原因（异常降级时填「异常类型: message」；检索为空时为 null）。 */
+    private String degradedReason;
     /** 是否命中答案缓存。 */
     private boolean cached;
     /** 查询改写后的表达（Query Rewrite，展示改写前后对比）。 */

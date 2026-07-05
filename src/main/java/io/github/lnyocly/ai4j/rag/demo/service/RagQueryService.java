@@ -26,6 +26,7 @@ import io.github.lnyocly.ai4j.service.IMessagesService;
 import io.github.lnyocly.ai4j.service.PlatformType;
 import io.github.lnyocly.ai4j.service.factory.AiService;
 import io.github.lnyocly.ai4j.vector.store.pgvector.PgVectorStore;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -45,6 +46,7 @@ import java.util.concurrent.TimeUnit;
  * 生成：GLM via IMessagesService（Anthropic Messages，拒答约束）
  * 缓存：Caffeine（key = tenant::originalQuestion）
  */
+@Slf4j
 @Service
 public class RagQueryService {
 
@@ -70,7 +72,7 @@ public class RagQueryService {
         this.queryRewriteService = queryRewriteService;
     }
 
-    public RagAnswer ask(ChatRequest request) throws Exception {
+    public RagAnswer ask(ChatRequest request) {
         String cacheKey = (request.getTenantId() == null ? "default" : request.getTenantId())
                 + "::" + normalize(request.getQuestion());
         RagAnswer cached = answerCache.getIfPresent(cacheKey);
@@ -78,66 +80,82 @@ public class RagQueryService {
             cached.setCached(true);
             return cached;
         }
+        try {
+            // ① 多租户：权限标签前置过滤（PgVector metadata jsonb where，KNN 前完成）
+            Map<String, Object> filter = new LinkedHashMap<String, Object>();
+            filter.put("permissionTag", permissionTagsFor(request.getTenantId()));
 
-        // ① 多租户：权限标签前置过滤（PgVector metadata jsonb where，KNN 前完成）
-        Map<String, Object> filter = new LinkedHashMap<String, Object>();
-        filter.put("permissionTag", permissionTagsFor(request.getTenantId()));
+            // ② Query Rewrite：口语 → 正式术语
+            String rewritten = queryRewriteService.rewrite(request.getQuestion());
 
-        // ② Query Rewrite：口语 → 正式术语
-        String rewritten = queryRewriteService.rewrite(request.getQuestion());
+            // ③ 检索 + ④ 重排（RagService 内部），开 trace 拿到 retrieved/reranked 两份顺序
+            RagQuery query = RagQuery.builder()
+                    .query(rewritten)
+                    .dataset(ragProperties.getDataset())
+                    .embeddingModel(ragProperties.getEmbeddingModel())
+                    .topK(ragProperties.getTopK())
+                    .filter(filter)
+                    .includeTrace(Boolean.TRUE)
+                    .build();
+            RagResult result = ragService.search(query);
 
-        // ③ 检索 + ④ 重排（RagService 内部），开 trace 拿到 retrieved/reranked 两份顺序
-        RagQuery query = RagQuery.builder()
-                .query(rewritten)
-                .dataset(ragProperties.getDataset())
-                .embeddingModel(ragProperties.getEmbeddingModel())
-                .topK(ragProperties.getTopK())
-                .filter(filter)
-                .includeTrace(Boolean.TRUE)
-                .build();
-        RagResult result = ragService.search(query);
+            // ⑤ 上下文组装（带 [S1][S2] 引用标记）
+            String context = result.getContext() == null ? "" : result.getContext();
+            boolean degraded = context.trim().isEmpty();
 
-        // ⑤ 上下文组装（带 [S1][S2] 引用标记）
-        String context = result.getContext() == null ? "" : result.getContext();
-        boolean degraded = context.trim().isEmpty();
+            // trace：召回原始顺序 + 重排后顺序
+            RagTrace trace = result.getTrace();
+            List<RagHit> retrievedSrc = (trace != null && trace.getRetrievedHits() != null)
+                    ? trace.getRetrievedHits() : result.getHits();
+            List<RagHit> rerankedSrc = (trace != null && trace.getRerankedHits() != null)
+                    ? trace.getRerankedHits() : result.getHits();
+            List<Map<String, Object>> retrievedHits = mapHits(retrievedSrc, false);
+            List<Map<String, Object>> rerankedHits = mapHits(rerankedSrc, true);
 
-        // trace：召回原始顺序 + 重排后顺序
-        RagTrace trace = result.getTrace();
-        List<RagHit> retrievedSrc = (trace != null && trace.getRetrievedHits() != null)
-                ? trace.getRetrievedHits() : result.getHits();
-        List<RagHit> rerankedSrc = (trace != null && trace.getRerankedHits() != null)
-                ? trace.getRerankedHits() : result.getHits();
-        List<Map<String, Object>> retrievedHits = mapHits(retrievedSrc, false);
-        List<Map<String, Object>> rerankedHits = mapHits(rerankedSrc, true);
+            // 引用溯源
+            List<ReferenceItem> references = new ArrayList<ReferenceItem>();
+            List<RagCitation> citations = result.getCitations() == null
+                    ? Collections.<RagCitation>emptyList() : result.getCitations();
+            for (RagCitation citation : citations) {
+                references.add(ReferenceItem.builder()
+                        .sourceName(citation.getSourceName())
+                        .sectionTitle(citation.getSectionTitle())
+                        .snippet(citation.getSnippet())
+                        .build());
+            }
 
-        // 引用溯源
-        List<ReferenceItem> references = new ArrayList<ReferenceItem>();
-        List<RagCitation> citations = result.getCitations() == null
-                ? Collections.<RagCitation>emptyList() : result.getCitations();
-        for (RagCitation citation : citations) {
-            references.add(ReferenceItem.builder()
-                    .sourceName(citation.getSourceName())
-                    .sectionTitle(citation.getSectionTitle())
-                    .snippet(citation.getSnippet())
-                    .build());
+            // ⑥ 生成（GLM，拒答约束）
+            String answer = generate(request.getQuestion(), context, degraded);
+
+            RagAnswer ragAnswer = RagAnswer.builder()
+                    .answer(answer)
+                    .references(references)
+                    .hitCount(result.getHits() == null ? 0 : result.getHits().size())
+                    .degraded(degraded)
+                    .cached(false)
+                    .rewrittenQuery(rewritten)
+                    .retrievedHits(retrievedHits)
+                    .rerankedHits(rerankedHits)
+                    .context(context)
+                    .build();
+            answerCache.put(cacheKey, ragAnswer);
+            return ragAnswer;
+        } catch (Exception ex) {
+            // RAG 链路任一步失败（rewrite / retrieve 整体挂 / rerank 挂 / generate 挂）：
+            // Hybrid 子路容错已在 SDK 层（PR #179），这里兜整体失败 —— 不让用户看到 500 或幻觉
+            log.warn("RAG ask failed, returning degraded answer: {}", ex.getMessage());
+            return RagAnswer.builder()
+                    .answer("抱歉，知识服务暂时不可用，请稍后重试或联系人工客服。")
+                    .references(Collections.<ReferenceItem>emptyList())
+                    .hitCount(0)
+                    .degraded(true)
+                    .degradedReason(ex.getClass().getSimpleName() + ": " + ex.getMessage())
+                    .cached(false)
+                    .retrievedHits(Collections.<Map<String, Object>>emptyList())
+                    .rerankedHits(Collections.<Map<String, Object>>emptyList())
+                    .context("")
+                    .build();
         }
-
-        // ⑥ 生成（GLM，拒答约束）
-        String answer = generate(request.getQuestion(), context, degraded);
-
-        RagAnswer ragAnswer = RagAnswer.builder()
-                .answer(answer)
-                .references(references)
-                .hitCount(result.getHits() == null ? 0 : result.getHits().size())
-                .degraded(degraded)
-                .cached(false)
-                .rewrittenQuery(rewritten)
-                .retrievedHits(retrievedHits)
-                .rerankedHits(rerankedHits)
-                .context(context)
-                .build();
-        answerCache.put(cacheKey, ragAnswer);
-        return ragAnswer;
     }
 
     /**
