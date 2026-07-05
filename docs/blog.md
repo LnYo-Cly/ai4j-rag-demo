@@ -516,26 +516,29 @@ ai4j 在这一层给了两种**互补**的 trace，对应"独立 RAG 流程"和"
 
 ### 16.1 RAG 级 per-step trace（每一步中间产物可见，排障检索质量）
 
-`RagService.search` 返回的 `RagResult` 带 `RagTrace`（`retrievedHits` 召回原始顺序 + `rerankedHits` 重排后顺序），每个 hit 带 `RagScoreDetail`（融合分来源）+ `RagCitation`（引用）。demo 的 `/api/rag/ask` 把这些全暴露到响应（`rewrittenQuery` / `retrievedHits` / `rerankedHits` / `context` / `answer`），一次请求 6 步全可见（真实输出见 18.7）：
+`RagService.search` 返回的 `RagResult` 带 `RagTrace`，字段现在完整覆盖全链：`queryPlan`（Query Planning 的 variants + fallback）+ `planningDurationMs` / `retrieveDurationMs` / `rerankDurationMs` / `assembleDurationMs` / `totalDurationMs`（各步耗时）+ `retrievedHits`（召回原始顺序）+ `rerankedHits`（重排后顺序）；每个 hit 带 `RagScoreDetail`（融合分来源）+ `RagCitation`（引用）。demo 的 `/api/rag/ask` 把这些全暴露到响应（`queryPlan` / `planningDurationMs` / `rewrittenQuery` / `retrievedHits` / `rerankedHits` / `context` / `answer`），一次请求每一步的中间产物 + 耗时全可见（真实输出见 18.7）：
 
 ```
 STEP 1  input        : 退款怎么弄
-STEP 2  rewritten    : 退款操作流程                    ← 改写后（口语→正式）
-STEP 3  retrievedHits（召回，rerank 前）:
+STEP 2  planning     : planningMs=1327  fallback=false                ← Query Planning（GLM 生成 variants 多路召回融合）
+                        variant[0] ORIGINAL  退款怎么弄
+                        variant[1] REWRITE   退款操作流程
+STEP 3  retrievedHits（召回，rerank 前）   retrieveMs=341:
           - refund-rules.md   score=0.491
           - after-sales.md    score=0.353
           - logistics.md      score=0.314
-STEP 4  rerankedHits（重排后）:
+STEP 4  rerankedHits（重排后）             rerankMs=210:
           - refund-rules.md   rerankScore=0.491
           - after-sales.md    rerankScore=0.353
           - logistics.md      rerankScore=0.314
-STEP 5  context      : [S1] refund-rules.md\n# 退款规则\n## 退款申请时效\n...
+STEP 5  context      : [S1] refund-rules.md\n# 退款规则\n## 退款申请时效\n...   (assembleMs=2)
 STEP 6  answer       : 根据参考资料，退款操作流程如下：1. 发起申请（注意时效）：订单签收 7 天内…
+                        totalMs=1880（planning+retrieve+rerank+assemble，generate 另算）
 ```
 
 **这套 trace 的排障价值**——假设线上有个 case 答错了，你按顺序质疑每一步：
 
-- STEP 2（rewrittenQuery）：是不是改写跑偏？（把"退款"改成无关词）
+- STEP 2（queryPlan / planning）：planning 生成的 variants 跑偏没？（把"退款"扩成无关词）/ fallback 了几次（GLM planning 抖动）/ `planningDurationMs` 占比过高（planning 比检索还慢就得不偿失）
 - STEP 3（retrievedHits）：是不是召回就没召对？（refund-rules 没进 TopK / 顺序错）
 - STEP 4（rerankedHits）：是不是重排把对的挤下去了？
 - STEP 5（context）：组装的上下文是不是塞了噪声 / 截断了关键段？
