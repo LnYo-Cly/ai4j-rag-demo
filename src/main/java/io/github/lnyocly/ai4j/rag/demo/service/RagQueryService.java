@@ -28,7 +28,6 @@ import io.github.lnyocly.ai4j.rag.RagService;
 import io.github.lnyocly.ai4j.rag.RagTrace;
 import io.github.lnyocly.ai4j.rag.demo.config.RagMetrics;
 import io.github.lnyocly.ai4j.rag.demo.config.RagProperties;
-import io.github.lnyocly.ai4j.rag.demo.evaluator.AnthropicRagJudge;
 import io.github.lnyocly.ai4j.rag.demo.domain.ChatRequest;
 import io.github.lnyocly.ai4j.rag.demo.domain.RagAnswer;
 import io.github.lnyocly.ai4j.rag.demo.domain.ReferenceItem;
@@ -94,8 +93,12 @@ public class RagQueryService {
                 ? aiService.getModelRagQueryPlanner(PlatformType.ANTHROPIC, ragProperties.getGlmModel(),
                         null, ragProperties.getPlannerMaxVariants(), true)
                 : null;
+        // 在线评估：直接用 SDK 工厂 + PlatformType.ANTHROPIC。ChatRagJudge 走 IChatService，
+        // 而 ANTHROPIC 平台的 IChatService 实现是 AnthropicChatService（OpenAI 格式⇄Anthropic Messages 适配器，
+        // 走 api/anthropic 端点 + coding-plan key）——所以无需自实现 judge，工厂一行即可。
+        // （陷阱：若用 PlatformType.ZHIPU 会走 paas/v4，coding-plan key 报余额不足。端点由 platform 决定。）
         this.onlineEvaluator = ragProperties.isOnlineEvalEnabled()
-                ? new RagOnlineEvaluator(new AnthropicRagJudge(this.messagesService, ragProperties.getGlmModel()))
+                ? aiService.getRagOnlineEvaluator(PlatformType.ANTHROPIC, ragProperties.getGlmModel())
                 : null;
     }
 
