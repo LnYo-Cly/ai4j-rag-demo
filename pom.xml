@@ -19,13 +19,22 @@
 
     <properties>
         <java.version>1.8</java.version>
-        <ai4j.version>2.4.2-SNAPSHOT</ai4j.version>
+        <ai4j.version>2.4.1</ai4j.version>
     </properties>
 
     <dependencies>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <!-- Micrometer Prometheus registry：/actuator/prometheus 暴露 cache 命中率 + ask 计数（K8s HPA / Grafana 用，17.3） -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
         </dependency>
         <!-- ai4j starter (compiled against SB 2.3.12 / Java 8; verifying SB 3.2 runtime compatibility) -->
         <dependency>

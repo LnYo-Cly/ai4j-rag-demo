@@ -1,7 +1,6 @@
 package io.github.lnyocly.ai4j.rag.demo.service;
 
 import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
 import io.github.lnyocly.ai4j.platform.anthropic.chat.entity.AnthropicChatCompletion;
 import io.github.lnyocly.ai4j.platform.anthropic.chat.entity.AnthropicChatCompletionResponse;
 import io.github.lnyocly.ai4j.platform.anthropic.chat.entity.AnthropicContentBlock;
@@ -19,7 +18,6 @@ import io.github.lnyocly.ai4j.rag.RagContextAssembler;
 import io.github.lnyocly.ai4j.rag.RagCitation;
 import io.github.lnyocly.ai4j.rag.Retriever;
 import io.github.lnyocly.ai4j.rag.RrfFusionStrategy;
-import io.github.lnyocly.ai4j.rag.RagGenerationUsage;
 import io.github.lnyocly.ai4j.rag.RagHit;
 import io.github.lnyocly.ai4j.rag.RagJudgeEvaluation;
 import io.github.lnyocly.ai4j.rag.RagOnlineEvaluator;
@@ -28,7 +26,9 @@ import io.github.lnyocly.ai4j.rag.RagQuery;
 import io.github.lnyocly.ai4j.rag.RagResult;
 import io.github.lnyocly.ai4j.rag.RagService;
 import io.github.lnyocly.ai4j.rag.RagTrace;
+import io.github.lnyocly.ai4j.rag.demo.config.RagMetrics;
 import io.github.lnyocly.ai4j.rag.demo.config.RagProperties;
+import io.github.lnyocly.ai4j.rag.demo.evaluator.AnthropicRagJudge;
 import io.github.lnyocly.ai4j.rag.demo.domain.ChatRequest;
 import io.github.lnyocly.ai4j.rag.demo.domain.RagAnswer;
 import io.github.lnyocly.ai4j.rag.demo.domain.ReferenceItem;
@@ -37,6 +37,7 @@ import io.github.lnyocly.ai4j.service.IMessagesService;
 import io.github.lnyocly.ai4j.service.PlatformType;
 import io.github.lnyocly.ai4j.service.factory.AiService;
 import io.github.lnyocly.ai4j.vector.store.pgvector.PgVectorStore;
+import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
@@ -46,7 +47,6 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
 /**
  * RAG 在线问答主链编排。每一步的中间产物都写进 RagAnswer，让一次请求的完整执行轨迹可见：
@@ -70,17 +70,21 @@ public class RagQueryService {
     private final RagContextAssembler contextAssembler;
     private final RagQueryPlanner planner;
     private final InMemoryCorpus inMemoryCorpus;
-    /** 在线评估器（LLM-as-judge，online-eval-enabled=true 时构造；走 ZHIPU OpenAI 协议 paas/v4）。
-     *  注意：judge 用的是 OpenAI 协议（IChatService），需要 ai.zhipu.api-key 配 paas/v4 的 key，
-     *  与 anthropic 入口的 coding-plan key 不是同一个——coding-plan key 打 paas/v4 会报余额不足。 */
+    private final MeterRegistry meterRegistry;
+    /** 在线评估器（LLM-as-judge，online-eval-enabled=true 时构造）。
+     *  用 demo 自实现的 {@link AnthropicRagJudge}——复用主答的 anthropic 通道（coding-plan key 有效），
+     *  不用 SDK 自带 ChatRagJudge（它走 OpenAI 协议→paas/v4，coding-plan key 打 paas/v4 报余额不足）。 */
     private final RagOnlineEvaluator onlineEvaluator;
 
     public RagQueryService(AiService aiService, PgVectorStore vectorStore, RagProperties ragProperties,
-                           QueryRewriteService queryRewriteService, InMemoryCorpus inMemoryCorpus) {
+                           QueryRewriteService queryRewriteService, InMemoryCorpus inMemoryCorpus,
+                           Cache<String, RagAnswer> answerCache, MeterRegistry meterRegistry) {
         this.ragProperties = ragProperties;
         this.messagesService = aiService.getMessagesService(PlatformType.ANTHROPIC);
         this.queryRewriteService = queryRewriteService;
         this.inMemoryCorpus = inMemoryCorpus;
+        this.answerCache = answerCache;
+        this.meterRegistry = meterRegistry;
         this.denseRetriever = new DenseRetriever(aiService.getEmbeddingService(PlatformType.OLLAMA), vectorStore);
         this.reranker = resolveReranker(aiService);
         this.contextAssembler = ragProperties.getMaxContextTokens() > 0
@@ -91,13 +95,8 @@ public class RagQueryService {
                         null, ragProperties.getPlannerMaxVariants(), true)
                 : null;
         this.onlineEvaluator = ragProperties.isOnlineEvalEnabled()
-                ? aiService.getRagOnlineEvaluator(PlatformType.ZHIPU, ragProperties.getGlmModel())
+                ? new RagOnlineEvaluator(new AnthropicRagJudge(this.messagesService, ragProperties.getGlmModel()))
                 : null;
-        this.answerCache = Caffeine.newBuilder()
-                .maximumSize(1000)
-                .expireAfterWrite(10, TimeUnit.MINUTES)
-                .recordStats()
-                .build();
     }
 
     /**
@@ -119,6 +118,7 @@ public class RagQueryService {
     }
 
     public RagAnswer ask(ChatRequest request) {
+        meterRegistry.counter(RagMetrics.ASK_COUNTER).increment();   // 入站请求计数（含缓存命中），HPA rate 用
         String cacheKey = (request.getTenantId() == null ? "default" : request.getTenantId())
                 + "::" + normalize(request.getQuestion());
         RagAnswer cached = answerCache.getIfPresent(cacheKey);
@@ -179,16 +179,10 @@ public class RagQueryService {
             AnthropicChatCompletionResponse genResp = generate(request.getQuestion(), context, degraded);
             String answer = extractText(genResp);
 
-            // token 用量回填 trace（SDK 2.4.1 数据通道：RagTrace.generationUsage）
+            // token 用量（GLM anthropic 非流式响应回填 usage，实测可用：{"input_tokens":N,"output_tokens":M}）。
+            // demo 把 token 直接放 RagAnswer（应用层展示）；SDK 2.4.2 另有 RagGenerationUsage（trace 级），
+            // 这里不用它以保持对已发布 2.4.1 的依赖（开箱即用，无需构建 SDK main）。
             AnthropicUsage usage = genResp == null ? null : genResp.getUsage();
-            if (trace != null && usage != null) {
-                trace.setGenerationUsage(RagGenerationUsage.builder()
-                        .model(ragProperties.getGlmModel())
-                        .inputTokens(usage.getInputTokens())
-                        .outputTokens(usage.getOutputTokens())
-                        .totalTokens(usage.getInputTokens() + usage.getOutputTokens())
-                        .build());
-            }
 
             // ⑦ 在线评估（LLM-as-judge：faithfulness/contextRelevance/answerRelevance）。
             //  非致命：judge 挂了（网络/余额/JSON 解析）不影响主答，scores 留空。

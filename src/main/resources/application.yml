@@ -21,19 +21,25 @@ ai:
     api-host: http://localhost:11434/
     embedding-url: api/embed
   anthropic:
-    # GLM coding-plan key 通过 Anthropic 兼容入口接入
+    # GLM coding-plan key 通过 Anthropic 兼容入口接入（主答 + 在线评估 judge 都走这里）
     api-host: https://open.bigmodel.cn/api/anthropic/
     api-key: ${GLM_API_KEY:}
     chat-completion-url: v1/messages
-  zhipu:
-    # OpenAI 兼容入口（paas/v4）——仅在线评估（LLM-as-judge）需要它，因为 ChatRagJudge 走 OpenAI 协议。
-    # 注意：coding-plan key（anthropic 入口那个）打 paas/v4 会报余额不足，这里要配 paas/v4 的常规 key。
-    # 没配 key 时把 rag.online-eval-enabled 留 false 即可，judge 不会构造。
-    api-host: https://open.bigmodel.cn/api/paas/
-    api-key: ${ZHIPU_API_KEY:}
   jina:
     api-key: ${JINA_API_KEY:}
     api-version: 2023-06-01
+
+# ---- actuator / micrometer（K8s 探针 + Prometheus 指标，十七章）----
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true   # 暴露 /actuator/health/readiness + /actuator/health/liveness（K8s 探针用，17.1）
+      show-details: always
 
 # ---- demo business config ----
 rag:
@@ -51,6 +57,8 @@ rag:
   hybrid-enabled: true  # true 开启 Hybrid 检索（Dense + BM25 + RRF；展示 PR #179 子路容错 best-effort）
   max-context-tokens: 4000  # TokenAware 上下文 token 预算（超则停追加，避免 prompt 溢出）；0=用默认组装器
   context-model: gpt-4  # jtokkit BPE encoding 名（国产模型传 gpt-4 近似即可）
-  online-eval-enabled: false  # true 开启在线评估（每答打 faithfulness/contextRelevance/answerRelevance 分）。
-                              #   需配 ai.zhipu.api-key（paas/v4 常规 key），且每答多一次 GLM 调用（成本+延迟）。
-  conversational-enabled: false  # true 开启多轮对话（RagQuery 带 history，planner rewrite 消解 follow-up 指代）。
+  online-eval-enabled: true  # true 开启在线评估（每答打 faithfulness/contextRelevance/answerRelevance 分）。
+                              #   judge 走 anthropic 通道（AnthropicRagJudge，复用主答的 coding-plan key），
+                              #   每答多一次 GLM 调用（成本+延迟），缓存命中时不重评。
+  conversational-enabled: true  # true 开启多轮对话（RagQuery 带 history，planner rewrite 消解 follow-up 指代）。
+                                  #   安全：history 为 null（单轮）时 planner appendHistory 直接跳过，不影响单轮。
