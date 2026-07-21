@@ -88,8 +88,8 @@ public class KnowledgeIngestionService {
             }
             total += result.getUpsertedCount();
             IngestionTrace t = result.getTrace();
-            log.info("Ingested [{}] {}: {} chunks | load={}ms chunk={}ms embed={}ms upsert={}ms total={}ms",
-                    permissionTag, resource.getFilename(), result.getUpsertedCount(),
+            log.info("Ingested [{}] {}: upserted={} skipped={} | load={}ms chunk={}ms embed={}ms upsert={}ms total={}ms",
+                    permissionTag, resource.getFilename(), result.getUpsertedCount(), result.getSkippedCount(),
                     t == null ? 0 : t.getLoadDurationMs(),
                     t == null ? 0 : t.getChunkDurationMs(),
                     t == null ? 0 : t.getEmbedDurationMs(),

@@ -6,6 +6,7 @@ import io.github.lnyocly.ai4j.platform.anthropic.chat.entity.AnthropicChatComple
 import io.github.lnyocly.ai4j.platform.anthropic.chat.entity.AnthropicChatCompletionResponse;
 import io.github.lnyocly.ai4j.platform.anthropic.chat.entity.AnthropicContentBlock;
 import io.github.lnyocly.ai4j.platform.anthropic.chat.entity.AnthropicMessage;
+import io.github.lnyocly.ai4j.platform.anthropic.chat.entity.AnthropicUsage;
 import io.github.lnyocly.ai4j.rag.DefaultRagContextAssembler;
 import io.github.lnyocly.ai4j.rag.TokenAwareRagContextAssembler;
 import io.github.lnyocly.ai4j.rag.NoopReranker;
@@ -18,7 +19,10 @@ import io.github.lnyocly.ai4j.rag.RagContextAssembler;
 import io.github.lnyocly.ai4j.rag.RagCitation;
 import io.github.lnyocly.ai4j.rag.Retriever;
 import io.github.lnyocly.ai4j.rag.RrfFusionStrategy;
+import io.github.lnyocly.ai4j.rag.RagGenerationUsage;
 import io.github.lnyocly.ai4j.rag.RagHit;
+import io.github.lnyocly.ai4j.rag.RagJudgeEvaluation;
+import io.github.lnyocly.ai4j.rag.RagOnlineEvaluator;
 import io.github.lnyocly.ai4j.rag.RagQueryPlanner;
 import io.github.lnyocly.ai4j.rag.RagQuery;
 import io.github.lnyocly.ai4j.rag.RagResult;
@@ -66,6 +70,10 @@ public class RagQueryService {
     private final RagContextAssembler contextAssembler;
     private final RagQueryPlanner planner;
     private final InMemoryCorpus inMemoryCorpus;
+    /** 在线评估器（LLM-as-judge，online-eval-enabled=true 时构造；走 ZHIPU OpenAI 协议 paas/v4）。
+     *  注意：judge 用的是 OpenAI 协议（IChatService），需要 ai.zhipu.api-key 配 paas/v4 的 key，
+     *  与 anthropic 入口的 coding-plan key 不是同一个——coding-plan key 打 paas/v4 会报余额不足。 */
+    private final RagOnlineEvaluator onlineEvaluator;
 
     public RagQueryService(AiService aiService, PgVectorStore vectorStore, RagProperties ragProperties,
                            QueryRewriteService queryRewriteService, InMemoryCorpus inMemoryCorpus) {
@@ -81,6 +89,9 @@ public class RagQueryService {
         this.planner = ragProperties.isPlannerEnabled()
                 ? aiService.getModelRagQueryPlanner(PlatformType.ANTHROPIC, ragProperties.getGlmModel(),
                         null, ragProperties.getPlannerMaxVariants(), true)
+                : null;
+        this.onlineEvaluator = ragProperties.isOnlineEvalEnabled()
+                ? aiService.getRagOnlineEvaluator(PlatformType.ZHIPU, ragProperties.getGlmModel())
                 : null;
         this.answerCache = Caffeine.newBuilder()
                 .maximumSize(1000)
@@ -126,12 +137,15 @@ public class RagQueryService {
                     : queryRewriteService.rewrite(request.getQuestion());
 
             // ③ 检索 + ④ 重排（RagService 内部），开 trace 拿到 retrieved/reranked 两份顺序
+            // conversational-enabled=true 时把对话历史带进 RagQuery：planner rewrite 会据此消解 follow-up 指代
+            // （如「它的退款」→「订单的退款」），让多轮问答能正确召回。
             RagQuery query = RagQuery.builder()
                     .query(rewritten)
                     .dataset(ragProperties.getDataset())
                     .embeddingModel(ragProperties.getEmbeddingModel())
                     .topK(ragProperties.getTopK())
                     .filter(filter)
+                    .history(ragProperties.isConversationalEnabled() ? request.getHistory() : null)
                     .includeTrace(Boolean.TRUE)
                     .build();
             RagResult result = buildRagService().search(query);
@@ -161,8 +175,36 @@ public class RagQueryService {
                         .build());
             }
 
-            // ⑥ 生成（GLM，拒答约束）
-            String answer = generate(request.getQuestion(), context, degraded);
+            // ⑥ 生成（GLM，拒答约束）——拿回 response 以提取 token 用量
+            AnthropicChatCompletionResponse genResp = generate(request.getQuestion(), context, degraded);
+            String answer = extractText(genResp);
+
+            // token 用量回填 trace（SDK 2.4.1 数据通道：RagTrace.generationUsage）
+            AnthropicUsage usage = genResp == null ? null : genResp.getUsage();
+            if (trace != null && usage != null) {
+                trace.setGenerationUsage(RagGenerationUsage.builder()
+                        .model(ragProperties.getGlmModel())
+                        .inputTokens(usage.getInputTokens())
+                        .outputTokens(usage.getOutputTokens())
+                        .totalTokens(usage.getInputTokens() + usage.getOutputTokens())
+                        .build());
+            }
+
+            // ⑦ 在线评估（LLM-as-judge：faithfulness/contextRelevance/answerRelevance）。
+            //  非致命：judge 挂了（网络/余额/JSON 解析）不影响主答，scores 留空。
+            Map<String, Object> scores = null;
+            if (onlineEvaluator != null) {
+                try {
+                    RagJudgeEvaluation eval = onlineEvaluator.evaluate(result, answer);
+                    scores = new LinkedHashMap<String, Object>();
+                    scores.put("faithfulnessScore", eval.getFaithfulnessScore());
+                    scores.put("contextRelevanceScore", eval.getContextRelevanceScore());
+                    scores.put("answerRelevanceScore", eval.getAnswerRelevanceScore());
+                    scores.put("reason", eval.getReason());
+                } catch (Exception ex) {
+                    log.warn("online eval failed (non-fatal, answer still returned): {}", ex.getMessage());
+                }
+            }
 
             RagAnswer ragAnswer = RagAnswer.builder()
                     .answer(answer)
@@ -180,6 +222,10 @@ public class RagQueryService {
                     .rerankDurationMs(trace != null ? trace.getRerankDurationMs() : 0L)
                     .assembleDurationMs(trace != null ? trace.getAssembleDurationMs() : 0L)
                     .totalDurationMs(trace != null ? trace.getTotalDurationMs() : 0L)
+                    .generationModel(ragProperties.getGlmModel())
+                    .inputTokens(usage != null ? usage.getInputTokens() : null)
+                    .outputTokens(usage != null ? usage.getOutputTokens() : null)
+                    .scores(scores)
                     .build();
             answerCache.put(cacheKey, ragAnswer);
             return ragAnswer;
@@ -262,7 +308,7 @@ public class RagQueryService {
         return Collections.singletonList("public");
     }
 
-    private String generate(String question, String context, boolean degraded) throws Exception {
+    private AnthropicChatCompletionResponse generate(String question, String context, boolean degraded) throws Exception {
         String system = "你是企业电商知识助手。严格根据下方参考资料回答用户问题。"
                 + "若资料不足以支撑答案，请明确说明\"根据当前知识库资料无法确认\"，"
                 + "不要编造制度、流程或时效。回答要简洁、准确、可执行。";
@@ -273,8 +319,7 @@ public class RagQueryService {
         req.setSystem(system);
         req.setMessages(Collections.singletonList(new AnthropicMessage("user", user)));
         req.setMaxTokens(1024);
-        AnthropicChatCompletionResponse resp = messagesService.messages(req);
-        return extractText(resp);
+        return messagesService.messages(req);
     }
 
     private String extractText(AnthropicChatCompletionResponse resp) {

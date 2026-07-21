@@ -122,7 +122,7 @@ ai4j 不把所有能力塞进 core，而是提供 `ai4j-extension-api` 扩展点
 | 维度 | 方案 |
 |---|---|
 | Web 框架 | Spring Boot 2.7（JDK 8 末代 LTS） |
-| AI SDK | ai4j 2.4.0（starter） |
+| AI SDK | ai4j 2.4.2-SNAPSHOT（starter；已发 2.4.1，main 在 2.4.2-SNAPSHOT） |
 | Embedding | Ollama + Qwen3-Embedding-0.6B（1024 维） |
 | Chat | GLM（Anthropic Messages，`IMessagesService`） |
 | 向量库 | PostgreSQL + pgvector |
@@ -663,11 +663,14 @@ ai4j 2.4.1 引入 `RagOnlineEvaluator` + `RagJudge`（可替换接口）+ 默认
 结果挂 `RagTrace.judgeEvaluation`（per-request 质量分，0-1）。这是 LangSmith/Langfuse 强调的「beyond debuggable」（超越可调试 → 可量化）—— **不只定位「哪步错」，还量化「这次答得有多好」**，可做质量趋势告警。
 
 ```java
-RagJudge judge = new ChatRagJudge(messagesService, "glm-4.6");   // 可换 Ragas / 自写
-RagOnlineEvaluator evaluator = new RagOnlineEvaluator(judge);
-RagJudgeEvaluation scores = evaluator.evaluate(query, context, answer);  // 三项分
-trace.setJudgeEvaluation(scores);
+// ChatRagJudge 走 OpenAI 协议（IChatService），所以用 ZHIPU paas/v4 入口（不是 anthropic 那个）
+RagOnlineEvaluator evaluator = aiService.getRagOnlineEvaluator(PlatformType.ZHIPU, "glm-4.6");
+RagJudgeEvaluation scores = evaluator.evaluate(ragResult, answer);  // 三项分，顺带挂到 trace.judgeEvaluation
 ```
+
+demo 里 `RagQueryService` 用 `rag.online-eval-enabled` 开关门控（默认关）：开了才构造 evaluator，每答多一次 GLM 调用打分，分挂在 `RagAnswer.scores`（+ `RagTrace.judgeEvaluation`）。judge 挂了非致命（网络/余额/JSON 解析），主答照常返回。
+
+> ⚠️ 注意一个 key 陷阱：`ChatRagJudge` 用 **OpenAI 协议**（`IChatService`），要走 GLM 的 `paas/v4` 入口；而主答走 **Anthropic 协议**（`IMessagesService`），用 `api/anthropic` 入口。**coding-plan key 只对 anthropic 入口有效**，拿它打 paas/v4 会报余额不足 —— judge 要单独配 `ai.zhipu.api-key`（paas/v4 常规 key）。这是 GLM 双入口的真实约束，不是 SDK 问题。
 
 `RagJudge` 是接口（对称 `Reranker` 可换 jina/llm）—— 不锁死算法，想接 Ragas 或换更强的 judge 模型，实现接口即可。
 
@@ -694,7 +697,126 @@ trace.setJudgeEvaluation(scores);
 > **OpenTelemetry 不在 ai4j core 引入**——保持"零基础设施依赖"哲学（像 PgVector 用 JDK `java.sql`、Redis 用 optional Jedis）。`RagTrace` / `IoCaptureSink` 已暴露完整数据，应用层 wrap 一下发到 OTel/Micrometer 即可（几行桥接）。如果将来需求强，可像 LangChain4j 那样出独立可选模块 `ai4j-observability-otel`，不污染 core。这是设计取舍，不是缺失。
 
 ## 十七、部署与发布
-本地试点（单体+单 Postgres+本地 Ollama）→ 小规模（问答/摄入拆分+MQ+Prometheus）→ 中大型（多副本+worker 集群+读写分离+配置中心）。K8s 关注 HPA/连接池/内存/滚动发布索引一致性。
+
+演进路径：本地试点（单体 + 单 Postgres + 本地 Ollama）→ 小规模（问答/摄入拆分 + MQ + Prometheus）→ 中大型（多副本 + worker 集群 + 读写分离 + 配置中心）。本节给出中规模 K8s 部署的最小可用配置，聚焦 RAG 上线最容易踩的几个点。
+
+### 17.1 问答服务 Deployment（无状态，可水平扩）
+
+问答服务是纯查询链路（检索 + 重排 + 生成），无本地状态，直接多副本：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-query
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: rag-query }
+  template:
+    metadata:
+      labels: { app: rag-query }
+    spec:
+      containers:
+      - name: query
+        image: registry.example.com/ai4j-rag-demo:2.4.2
+        ports: [{ containerPort: 8080 }]
+        env:
+        - name: GLM_API_KEY
+          valueFrom: { secretKeyRef: { name: ai-secrets, key: glm-key } }
+        - name: SPRING_DATASOURCE_URL   # 覆盖 application.yml，走集群 Postgres
+          value: jdbc:postgresql://pg-primary:5432/rag?currentSchema=rag
+        - name: JAVA_TOOL_OPTIONS       # JDK8 容器内存感知（不加的话 K8s 限内存会被 OOMKilled）
+          value: "-XX:+UseContainerSupport -XX:MaxRAMPercentage=75"
+        resources:
+          requests: { cpu: "500m", memory: "1Gi" }
+          limits:   { cpu: "2",    memory: "2Gi" }
+        readinessProbe:                # 就绪探针：Caffeine/连接池/模型 client 都起来才接流量
+          httpGet: { path: /actuator/health/readiness, port: 8080 }
+          initialDelaySeconds: 30
+        livenessProbe:
+          httpGet: { path: /actuator/health/liveness, port: 8080 }
+          initialDelaySeconds: 60
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-query
+spec:
+  selector: { app: rag-query }
+  ports: [{ port: 80, targetPort: 8080 }]
+```
+
+**几个要点**：
+- **`MaxRAMPercentage=75`**：JDK8 默认不认 cgroup 内存限制，不加 `-XX:+UseContainerSupport` 会按宿主机内存算堆，被 K8s OOMKilled。留 25% 给堆外（OkHttp 连接池、JIT、DirectBuffer）。
+- **就绪探针 ≠ 活性探针**：就绪探针失败只是从 Service 摘除流量（不重启），摄入没跑完/模型 client 没建好时不要接请求；活性探针失败才重启 Pod。
+- **GLM key 走 Secret 不走 ConfigMap**：key 泄漏是真实事故，Secret 至少能配合 RBAC 限访问。
+
+### 17.2 摄入 worker Deployment（和问答拆开）
+
+摄入是写链路（embed + upsert），和问答拆开部署——写链路挂了不影响线上问答，问答扩容也不带动昂贵的 embedding 计算：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-ingest-worker
+spec:
+  replicas: 1                    # 摄入靠 content-hash 幂等（10.5），多副本并发写同 chunk 也安全，但单副本够用
+  selector:
+    matchLabels: { app: rag-ingest }
+  template:
+    metadata:
+      labels: { app: rag-ingest }
+    spec:
+      containers:
+      - name: ingest
+        image: registry.example.com/ai4j-rag-demo:2.4.2
+        env:
+        - name: RAG_ROLE
+          value: ingest           # demo 用 profile 开关：ingest profile 只跑 ApplicationRunner 不暴露 /api/rag
+        - name: OLLAMA_HOST
+          value: http://ollama-svc:11434   # embedding 模型独立部署，不和问答抢 GPU/CPU
+```
+
+> demo 当前是单体（问答+摄入一个进程）。生产拆两个 Deployment：摄入用 MQ（Kafka/RocketMQ）触发，ApplicationRunner 改成 MQ consumer；问答服务不打包摄入逻辑。拆分后 embedding 模型（Ollama）也可以独占一台机器，不被问答的 GLM 调用抢占。
+
+### 17.3 HPA（按 QPS 自动扩问答副本）
+
+问答服务的瓶颈是 GLM 调用延迟（P99 可能到几秒），不是 CPU——CPU-based HPA 在等 IO 时会误判。用自定义指标（每副本 QPS）扩容更准：
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rag-query
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: rag-query }
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Pods
+    pods:
+      metric: { name: rag_requests_per_second }   # Prometheus Adapter 暴露的自定义指标
+      target: { type: AverageValue, averageValue: "5" }   # 每副本 5 QPS 触发扩容
+  behavior:                       # 防抖：扩容快、缩容慢，避免流量波动反复伸缩
+    scaleUp:   { stabilizationWindowSeconds: 0,   policies: [{ type: Percent, value: 100, periodSeconds: 30 }] }
+    scaleDown: { stabilizationWindowSeconds: 300, policies: [{ type: Percent, value: 25,  periodSeconds: 60 }] }
+```
+
+> demo 暴露了 `cacheStats()`（命中率/请求数），接 Micrometer → Prometheus → Prometheus Adapter 就能做 QPS 指标。HPA 用 CPU 指标是反模式：RAG 大部分时间在等 GLM/PG，CPU 低，按 CPU 扩会扩不动。
+
+### 17.4 上线最容易踩的几个配置
+
+| 配置 | 坑 | 正解 |
+|---|---|---|
+| PgVector 连接池 | 多副本 × 每副本默认 HikariCP 10 连接，3 副本就 30 连接，PG 默认 max_connections=100 很快打满 | HikariCP `maximumPoolSize` 按副本收敛（如 8），或上 PgBouncer |
+| GLM 超时 | OkHttp 默认超时 10s，GLM 长 context 生成常 >10s，偶发 SocketTimeoutException | OkHttp `readTimeout` 调到 60s+，配合 Resilience4j 超时熔断 |
+| 滚动发布索引一致性 | 新版本 embedding 模型（如 Qwen3 → bge-m3）维度变了，新老副本读同一张表会维度不匹配 | **索引版本化**：`dataset=ecommerce-kb-v2`，蓝绿切，老副本读 v1、新副本写 v2，切完再下 v1 |
+| Embedding 模型升级 | 直接换模型会让新向量和新查询向量不同空间，召回质量暴跌 | 双写期：新查询同时 embed 新旧两套，分别召回，灰度切流量 |
+| 内存 | JDK8 不认容器限制 | `-XX:+UseContainerSupport`（JDK8u191+）或升 JDK11 |
+
+**索引版本化是 RAG 上线和普通 Web 服务最大的区别**：Web 服务无状态，滚动发布天然安全；RAG 的向量索引是有状态的共享数据，模型/分词变了就必须版本化，否则新老副本读到不一致的向量空间，召回质量无声暴跌。
 
 ## 十八、真实运行结果（demo 实际输出）
 

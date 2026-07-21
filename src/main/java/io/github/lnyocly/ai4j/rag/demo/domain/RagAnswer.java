@@ -52,4 +52,17 @@ public class RagAnswer {
     private long assembleDurationMs;
     /** search 总耗时（planning + retrieve + rerank + assemble）。 */
     private long totalDurationMs;
+
+    // ---- 生成用量 + 在线评估（SDK 2.4.1 数据通道：token/cost + LLM-as-judge 打分）----
+
+    /** 生成模型名。 */
+    private String generationModel;
+    /** 生成输入 token（prompt）。 */
+    private Long inputTokens;
+    /** 生成输出 token（completion）。 */
+    private Long outputTokens;
+
+    /** 在线评估打分（LLM-as-judge，online-eval-enabled=true 时填）：
+     *  {faithfulnessScore, contextRelevanceScore, answerRelevanceScore, reason}。 */
+    private Map<String, Object> scores;
 }
