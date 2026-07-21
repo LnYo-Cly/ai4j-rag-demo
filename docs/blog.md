@@ -56,6 +56,18 @@
 ### 5.3 Ollama embedding
 本地、免费、零网络延迟、中文好。生产高峰可切云端（`IEmbeddingService` 换实现）。
 
+### 5.4 plugin 生态（extension-api）：core 精简 + 能力扩展
+
+ai4j 不把所有能力塞进 core，而是提供 `ai4j-extension-api` 扩展点（plugin 机制，`ServiceLoaderExtensionLoader` SPI 自动发现，加 jar 即生效）：
+
+- `AgentListener` / `ObserveHook`：订阅 agent 事件（做 OTel/Micrometer 桥接，发 trace 到外部可观测平台）
+- `ToolInterceptor` / `PromptInterceptor`：拦截工具调用 / prompt（审批、改写、block）
+- `ExtensionGuardrail`：输入/输出护栏（PII 脱敏、prompt injection 防护）
+- `PromptRegistry`：prompt 资源管理（版本化）
+- `VectorStore` / `IEmbeddingService` / `Reranker` / `DocumentLoader` 接口：实现新后端 / 新模型 / OCR
+
+**core 只管 RAG/agent 主链 + 数据通道（`RagTrace` / `IoCaptureSink`）**，其余能力（OTel 桥接 / Weaviate / guardrail / embedding cache / 多模态）走 plugin —— 对比参考文章的 Spring AI（治理靠 Spring 生态外接），ai4j 把扩展点内建为 extension-api，plugin 是一等公民（已有例子：`ai4j-plugin-ask-user`）。这意味着本文没讲的治理（限流/熔断/灾备）和安全（脱敏/injection），都能用 plugin 补，不用改 core。
+
 ## 六、企业级 RAG 架构设计
 
 ```
@@ -186,6 +198,25 @@ documentId 用文件名确定性派生（`UUID.nameUUIDFromBytes`），重启幂
 ### 10.4 staging（版本化）
 双 dataset（`ecommerce-kb-v1` active / `v2` staging）并行 + 原子切换。PgVector `dataset` 列天然支持。
 
+### 10.5 增量 ingest：content-hash 跳过未变更 chunk（省 embed，PR #187）
+
+10.3 的「重启幂等」靠 upsert（同 chunkId 覆盖）—— 但**每次重启都重新 embed 全部 chunk**（embed 是成本大头），浪费。生产知识库大时（几万 chunk），全量 re-embed 慢且贵。
+
+ai4j PR #187 给 `IngestionPipeline` 加 **content-hash 增量**：自动给每个 chunk 的 metadata 写 `contentHash = SHA-256(content)`；`IngestionRequest.skipExistingContentHash=true` 时，upsert 前先 `vectorStore.exists(filter={contentHash})` 查重 —— 已存在就 skip（**embed + upsert 两步都省**），`IngestionResult.skippedCount` 统计跳过数：
+
+```java
+pipeline.ingest(IngestionRequest.builder()
+        .dataset("ecommerce-kb")
+        .skipExistingContentHash(true)   // ← 增量：content 未变的 chunk 跳过 embed+upsert
+        // ...
+        .build());
+// result.getSkippedCount() = N（未变更 chunk 数，省了 N 次 embed 调用）
+```
+
+`VectorStore.exists` 是可选 metadata-only lookup（后端声明 `VectorStoreCapabilities.metadataLookup`）：PgVector / Qdrant / Milvus / Redis 支持（走 metadata 索引），Pinecone 不支持（默认 skip 无效，退化为全量）。
+
+**和 10.3 重启幂等的区别**：upsert idempotent 省的是「写」（同 chunkId 覆盖），content-hash 增量省的是「**embed**」（embedding API 调用，成本大头）。生产 re-ingest 时，未变更文档的 chunk 直接 skip embed，只对真正改动的文档付出 embed 成本。
+
 ## 十一、在线问答架构
 
 标准 13 步链路（鉴权→租户→缓存→改写→embedding→混合召回→权限过滤→重排→组装→生成→引用→缓存）。demo 主链覆盖检索/重排/组装/生成/引用/缓存。
@@ -250,6 +281,37 @@ private Reranker resolveReranker(AiService aiService) {
 ```
 
 > **实践建议**：先 `none` 跑通，用 `RagEvaluator` 量 Recall@K / MRR / NDCG（见 13.6 / 18.3）。指标达标就别上 reranker（省成本）；不达标再开 jina/llm，再量一次看提升值不值这次模型调用的代价。**让数据决定，别拍脑袋。**
+
+### 11.3 Conversational RAG：多轮对话的 query rewrite（带 history）
+
+11.1 的 `QueryRewriteService` 是**单轮**的（只看当前 query）。但生产是**多轮对话**：用户 Q1「退款怎么弄」答完，Q2 follow-up「那时效呢」—— 单轮 rewrite 只看到「时效」，检索会跑偏到「物流时效」。
+
+ai4j 2.4.1（PR #190）把 history 接进 **retrieve 层**：`RagQuery` 加 `history: List<ChatMemoryItem>`，`ModelRagQueryPlanner.plan` 把 history 拼进 LLM prompt，生成 variant 时消解 follow-up 指代：
+
+```java
+RagQuery query = RagQuery.builder()
+        .query("时效呢")
+        .history(chatMemory.items())   // ← 带对话历史
+        .build();
+// ModelRagQueryPlanner 内部 prompt："Conversation history: [Q1:退款怎么弄, A1:...] query: 时效呢"
+//   → variant "退款时效"（消解指代）→ retrieve 命中退款时效，不跑偏
+```
+
+**关键区别**：这是 retrieve 层带 history rewrite，不是 generate 层。generate 层（agent memory）是 LLM 看 history + **跑偏的 context** 硬推断；retrieve 层（Conversational RAG）是 query 先消解指代再 retrieve，**context 一开始就对**。参考文章讲的 Spring AI rewrite 不带 history，这是 ai4j 的增量。
+
+### 11.4 TokenAware context：token 级预算（不是字符截断）
+
+参考文章 13.10 讲 Prompt 预算（`MAX_CONTEXT_CHARS` 字符级截断）。字符级的问题：中英文 token 密度不同（中文 1 字 ≈ 1-2 token，英文 1 word ≈ 1 token），字符截断不准 —— 可能超 LLM `max_tokens` 报错，或留太多余量浪费。
+
+ai4j 2.4.1（PR #188）`TokenAwareRagContextAssembler`：**token 级预算**（jtokkit 精确 BPE 计数），超 budget 停追加（reranked 高相关在前，保留前 N），第一个 hit 自己超长才截断（至少答一个，不全空），citations 只保留实际进 context 的来源：
+
+```java
+new DefaultRagService(retriever, reranker,
+        new TokenAwareRagContextAssembler("gpt-4", 4096),   // ← token 预算（jtokkit 精确）
+        planner);
+```
+
+PR #189 进一步把 encoding fallback 做成三层（普通传模型名 / 高级 `withEncoding` / 未知模型降级不失败）—— 国产模型 jtokkit 不认时降级 `CL100K_BASE` BPE 近似，不抛异常。token 级预算比字符级精确，context 既不超 `max_tokens`，也不留余量浪费。
 
 ## 十二、PgVector 索引设计：把过滤前置到召回之前
 
@@ -588,6 +650,47 @@ demo `/api/agent/ask` 实测：agent 自主决定调 `knowledge_search`，captur
 
 一句话：独立 RAG 用 16.1 看检索内部；RAG 进 agent 用 16.2 看整体决策——后者还能重放恢复，是生产级 agent 的命脉。
 
+### 16.3 online evaluation：不只排障，还量化每答质量（LLM-as-judge）
+
+参考文章 16.3 讲「质量评估指标」（Recall@K / MRR / Grounded Rate）—— 但那是**离线评测集**（offline，固定 query + 人工标注）。生产运行时**每个回答**的质量，传统只能靠用户反馈（点赞/点踩），滞后且稀疏。
+
+ai4j 2.4.1 引入 `RagOnlineEvaluator` + `RagJudge`（可替换接口）+ 默认 `ChatRagJudge`（GLM-as-judge），**每个回答自动打分**：
+
+- `faithfulness`：答案每句是否忠于检索 context（检测幻觉）
+- `relevance`：检索 context 是否相关 query（检测召回跑偏）
+- `answerRelevance`：答案是否回应了 query
+
+结果挂 `RagTrace.judgeEvaluation`（per-request 质量分，0-1）。这是 LangSmith/Langfuse 强调的「beyond debuggable」（超越可调试 → 可量化）—— **不只定位「哪步错」，还量化「这次答得有多好」**，可做质量趋势告警。
+
+```java
+RagJudge judge = new ChatRagJudge(messagesService, "glm-4.6");   // 可换 Ragas / 自写
+RagOnlineEvaluator evaluator = new RagOnlineEvaluator(judge);
+RagJudgeEvaluation scores = evaluator.evaluate(query, context, answer);  // 三项分
+trace.setJudgeEvaluation(scores);
+```
+
+`RagJudge` 是接口（对称 `Reranker` 可换 jina/llm）—— 不锁死算法，想接 Ragas 或换更强的 judge 模型，实现接口即可。
+
+### 16.4 replay + 断点续跑：agent 失败从断点恢复（IoCapture，行业少有）
+
+16.2 的 `IoCaptureSink` 不只审计，还能**重放** + **断点续跑**：
+
+- `NodeReplayer.replayModelLive(record, client)`：用 captured 的 `AgentPrompt` 重新调 model（复现/对比不同模型）
+- `NodeReplayer.replayModelMock(record)`：不调 model，直接返 captured output（快速重放，0 成本）
+- `ResumableModelClient` / `ResumableToolExecutor`：agent 失败后，**从失败的 MODEL/TOOL 节点续跑**（成功步不重调），省 token + 审计
+
+这是生产 agent 的命脉 —— 一个 10 步 agent 跑到第 8 步失败，传统要重跑全部（10 步 model/tool 都重调，贵）；IoCapture 续跑只重调第 8-10 步。**LangSmith 有 replay 但没有断点续跑**（它只看 trace，不接管 runtime）；ai4j 这点是真正超越的。
+
+### 16.5 cost：全链 token + $ 可见
+
+| 路径 | token 来源 | cost |
+|---|---|---|
+| agent | IoCapture `NodeIoRecord.inputTokens/outputTokens`（per MODEL 节点） | `TraceMetrics`（token × pricing，#186） |
+| 独立 RAG | `RagGenerationUsage`（#200，generate usage 上层回填） | `generationUsage.inputCost/totalCost`（上层算） |
+
+全链成本归因到每步（agent 每 MODEL 节点 / RAG generate），对标参考「成本可控制」但 ai4j **per-request per-step $ 可见**（不只总量）。注意 core 不塞 pricing 表（易变 + 业务决策），只给数据通道（`RagGenerationUsage`），price 由 demo/plugin 填 —— 保持 core 精简。
+
+
 > **OpenTelemetry 不在 ai4j core 引入**——保持"零基础设施依赖"哲学（像 PgVector 用 JDK `java.sql`、Redis 用 optional Jedis）。`RagTrace` / `IoCaptureSink` 已暴露完整数据，应用层 wrap 一下发到 OTel/Micrometer 即可（几行桥接）。如果将来需求强，可像 LangChain4j 那样出独立可选模块 `ai4j-observability-otel`，不污染 core。这是设计取舍，不是缺失。
 
 ## 十七、部署与发布
@@ -729,6 +832,16 @@ STEP 6  answer       : 根据参考资料，退款操作流程如下：1. 发起
 **基础设施演进**：
 - 知识量涨 → PgVector→Milvus/Qdrant（`VectorStore` 不变）
 - 复杂检索 → `HybridRetriever` 接 ES 做 `Bm25Retriever`
+
+**能力演进（走 plugin，不改 core，见 5.4 extension-api）**：
+- 可观测聚合 → 写 `ai4j-observability-otel` plugin（实现 `AgentListener`，把 `RagTrace`/`IoCapture` 发到 OTel/Prometheus，做 p99/cost trend/告警 dashboard）
+- 新向量后端 → `ai4j-vector-weaviate` / `ai4j-vector-chroma`（实现 `VectorStore` + `VectorStoreCapabilities`）
+- 安全护栏 → `ai4j-guardrail-pii` / `ai4j-guardrail-injection`（实现 `ExtensionGuardrail`，输入/输出拦截）
+- 多模态 RAG → 新 `IEmbeddingService`（图片向量，CLIP）+ `DocumentLoader`（OCR）
+- embedding cache → 装饰 `IEmbeddingService`
+- rerank 软失败 / 独立 RAG cost → 装饰 `Reranker` / 填 `RagGenerationUsage`
+
+参考文章 20 章讲「Redis → ES/Milvus → 智能体」三层演进；ai4j 的演进分两条：**基础设施换后端（`VectorStore` SPI）** + **能力加 plugin（extension-api）**。后者是 ai4j 独有 —— core 不动，治理/安全/可观测/多模态都靠 plugin 扩展，避免 core 膨胀。这也是为什么本文 14/15 章讲的治理（限流/熔断/灾备）和安全（脱敏/injection）没塞进 core，而是留给 plugin 生态。
 
 ### 20.1 从 RAG 问答到电商客服 agent（把整条链路串起来）
 
