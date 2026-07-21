@@ -66,6 +66,7 @@ public class KnowledgeIngestionService {
             IngestionResult result = pipeline.ingest(IngestionRequest.builder()
                     .dataset(ragProperties.getDataset())
                     .embeddingModel(ragProperties.getEmbeddingModel())
+                    .skipExistingContentHash(true)   // ← 增量：未变更 chunk 跳过 embed+upsert
                     .source(IngestionSource.text(content))
                     .document(RagDocument.builder()
                             .documentId(docId)

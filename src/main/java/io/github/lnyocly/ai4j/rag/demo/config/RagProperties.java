@@ -41,4 +41,16 @@ public class RagProperties {
 
     /** 是否启用 Hybrid 检索（Dense + 内存 BM25 + RRF 融合；BM25 用 public corpus，多租户不泄漏）。 */
     private boolean hybridEnabled = false;
+
+    /** context 组装 token 预算（TokenAwareRagContextAssembler，超则停追加；0=用默认 DefaultRagContextAssembler）。 */
+    private int maxContextTokens = 0;
+
+    /** token 计数模型名（jtokkit encoding 近似，国产模型传 gpt-4 即可）。 */
+    private String contextModel = "gpt-4";
+
+    /** 是否启用 online evaluation（LLM-as-judge 给每答打 faithfulness/relevance 分）。 */
+    private boolean onlineEvalEnabled = false;
+
+    /** 是否启用 Conversational RAG（RagQuery 带 chat history，planner rewrite 时消解 follow-up 指代）。 */
+    private boolean conversationalEnabled = false;
 }

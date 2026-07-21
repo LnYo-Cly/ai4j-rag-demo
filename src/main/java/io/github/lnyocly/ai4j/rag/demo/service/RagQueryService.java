@@ -7,6 +7,7 @@ import io.github.lnyocly.ai4j.platform.anthropic.chat.entity.AnthropicChatComple
 import io.github.lnyocly.ai4j.platform.anthropic.chat.entity.AnthropicContentBlock;
 import io.github.lnyocly.ai4j.platform.anthropic.chat.entity.AnthropicMessage;
 import io.github.lnyocly.ai4j.rag.DefaultRagContextAssembler;
+import io.github.lnyocly.ai4j.rag.TokenAwareRagContextAssembler;
 import io.github.lnyocly.ai4j.rag.NoopReranker;
 import io.github.lnyocly.ai4j.rag.Reranker;
 import io.github.lnyocly.ai4j.rag.DefaultRagService;
@@ -74,7 +75,9 @@ public class RagQueryService {
         this.inMemoryCorpus = inMemoryCorpus;
         this.denseRetriever = new DenseRetriever(aiService.getEmbeddingService(PlatformType.OLLAMA), vectorStore);
         this.reranker = resolveReranker(aiService);
-        this.contextAssembler = new DefaultRagContextAssembler();
+        this.contextAssembler = ragProperties.getMaxContextTokens() > 0
+                ? new TokenAwareRagContextAssembler(ragProperties.getContextModel(), ragProperties.getMaxContextTokens())
+                : new DefaultRagContextAssembler();
         this.planner = ragProperties.isPlannerEnabled()
                 ? aiService.getModelRagQueryPlanner(PlatformType.ANTHROPIC, ragProperties.getGlmModel(),
                         null, ragProperties.getPlannerMaxVariants(), true)
