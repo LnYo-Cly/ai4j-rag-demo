@@ -721,6 +721,62 @@ ai4j **per-request per-step $ 可见**（不只总量）。注意 core 不塞 pr
 
 > **OpenTelemetry 不在 ai4j core 引入**——保持"零基础设施依赖"哲学（像 PgVector 用 JDK `java.sql`、Redis 用 optional Jedis）。`RagTrace` / `IoCaptureSink` 已暴露完整数据，应用层 wrap 一下发到 OTel/Micrometer 即可（几行桥接）。如果将来需求强，可出独立可选模块 `ai4j-observability-otel`，不污染 core。这是设计取舍，不是缺失。
 
+### 16.6 offline evaluation：评测集 + 检索质量指标（Recall@K / MRR / NDCG）
+
+16.3 的 online eval 是"每个回答打分"（LLM-as-judge，运行时质量信号）。但它回答不了"换了 chunk 大小、换了 embedding 模型、加了 BM25，检索到底是变好还是变差"——这种**配置对比**需要一份固定评测集 + 可比指标。这就是 offline evaluation。
+
+**online vs offline**：
+
+| 维度 | online eval（16.3） | offline eval（本节） |
+|---|---|---|
+| 评什么 | 答案质量（faithfulness / 相关性） | 检索质量（召回到没、排第几） |
+| 评测集 | 无（每答现评） | 固定 `{query, 期望文档}` |
+| 依赖 | LLM（judge 调用） | 仅检索（embedding + 向量库），无 LLM |
+| 用途 | 运行时质量监控 / 告警 | 配置对比、回归门禁、调参 |
+
+**三个指标**（ai4j `RagEvaluator` 实装，针对"前 K 个结果里有没有、排第几"）。设评测集对某 query 标注了 relevant 文档集合 R，检索返回有序列表：
+
+- **Recall@K** = |前 K 个 ∩ R| / |R|。答"**该召回的有没有召回到**"。漏召回是致命的——后续生成再强也没有素材。
+- **MRR（Mean Reciprocal Rank）** = 1 / (第一个 relevant 的位次)。答"**相关结果排得够不够靠前**"。rank=1 → 1.0，rank=2 → 0.5。LLM 的 context 预算有限，相关文档排第 1 还是第 5，直接决定它进不进 context。
+- **NDCG** = DCG / IDCG，其中 DCG = Σ 1/log₂(rank+1)。和 MRR 都看位次，但 NDCG 能处理**多个 relevant 文档**（不只看第一个），且高位次权重按对数衰减。
+
+> 单 relevant 文档时（demo 评测集每 query 1 个期望文档），MRR 和 NDCG 都退化成"位次的函数"，看起来高度相关——这是评测集设计的取舍，不是指标冗余。多 relevant 场景（一个 query 该召回多篇）下，NDCG 才和 MRR 拉开差距。
+
+**demo 实装**（`GET /api/rag/evaluate`）：
+
+```java
+RagEvaluator evaluator = new RagEvaluator();
+// 评测集：{query, 期望命中的文件名}；chunkId 由文件名确定性派生，可静态声明
+RagEvaluation e = evaluator.evaluate(r.getHits(), Collections.singletonList(relevantChunkId), 5);
+// → recallAt5 / mrr / ndcg / precisionAt5 / f1
+```
+
+评测集 3 条（秒杀退款 → `refund-rules.md`、配送时效 → `logistics.md`、售后 → `after-sales.md`），用 Hybrid（Dense + BM25 + RRF）检索，topK=5。
+
+**实测结果**（demo 真实输出）：
+
+```
+retriever: hybrid(dense+bm25+rrf)
+meanRecallAt5: 1.0   meanMrr: 1.0   meanNdcg: 1.0
+```
+
+3 条 query 全部在 top-5 命中期望文档、且都排第 1。
+
+**这份分数要诚实看**：评测集太小、太简单——3 条 query、每条 1 个期望文档、全部 rank-1。1.0 只说明"没召回错"，**区分不出配置好坏**（换 chunk 大小、换 embedding 模型，分数都会是 1.0，看不出差异）。一个能指导调参的评测集至少要：
+
+- **足够多条**（几十到上百），覆盖正常 / 口语 / 长尾 / 歧义 query；
+- **硬负例**：故意放容易混淆的文档（如 `refund-rules` 和 `after-sales` 都讲时效），逼检索做对区分；
+- **多 relevant**：一个 query 该召回多篇时标注多个，让 NDCG 有用武之地；
+- **入库 + 进版本控制**：评测集固定，每次知识 / 配置变更后回归对比。
+
+**怎么用 offline eval**：
+
+- **回归门禁**：知识库更新、换 embedding 模型、改 chunk 策略后跑一遍，分数下降就拦住发布——比肉眼抽检客观。
+- **配置对比**：同评测集跑 Dense vs Hybrid、topK=5 vs 10、不同 reranker，用指标量化"加 BM25 到底值不值那点复杂度"。
+- **调参依据**：chunk 大小、topK、RRF 的 k 常数——靠指标调，不靠拍脑袋。
+
+demo 这 3 条评测集是"展示机制"的最小样例；生产请扩成有区分度的评测集，eval 才真正发挥作用。
+
 ## 十七、部署与发布
 
 演进路径：本地试点（单体 + 单 Postgres + 本地 Ollama）→ 小规模（问答/摄入拆分 + MQ + Prometheus）→ 中大型（多副本 + worker 集群 + 读写分离 + 配置中心）。本节给出中规模 K8s 部署的最小可用配置，聚焦 RAG 上线最容易踩的几个点。
@@ -906,7 +962,7 @@ premium 租户能看到 `marketing.md`（秒杀不叠加券）+ `merchant.md`（
   ]
 }
 ```
-3 个 case 全部命中（Recall/MRR/NDCG = 1.0）。`RagEvaluator` 让你每次调切块/embedding 模型/融合策略都能回归——不靠"用户感觉"。
+3 个 case 全部命中（Recall/MRR/NDCG = 1.0）。指标含义、为什么这套评测集"分数漂亮但区分度不足"、以及怎么扩成能指导调参的评测集，见 16.6。`RagEvaluator` 让你每次调切块/embedding 模型/融合策略都能回归——不靠"用户感觉"。
 
 ### 18.4 缓存命中
 问过的同一问题（同 tenant+question）再问：
@@ -1026,6 +1082,8 @@ GET /actuator/prometheus         → rag_cache_size / rag_cache_gets_total{resul
 15. **Jina rerank 国内需 proxy**：`api.jina.ai` 国内直连超时，要走代理（`-Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=10809`）或换 GLM 兜底重排。
 
 16. **readiness 启动期 OUT_OF_SERVICE**：`ApplicationRunner`（摄入）跑的时候 readiness 是 `OUT_OF_SERVICE`（503），跑完才 `UP`。K8s 探针的 `initialDelaySeconds` 要留够摄入时间，否则 Pod 起来就被摘流量循环重启。
+
+17. **增量摄入 skip 让 Hybrid 静默退化为 Dense**（demo 实测修过）：开了 `skipExistingContentHash` 后，暖库重启时未变更 chunk 全部 skip，`IngestionResult.records` 为空。若 `InMemoryCorpus`（BM25 的语料）是从 `records` 填的，skip 后 corpus 就空了 → `HybridRetriever` 因 corpus 空静默退化为纯 Dense，检索质量下降**但不报错**。修法：corpus 是"库里有什么"的读模型，用文件内容（或查库）填，与 upsert 解耦——别让它依赖会被 skip 清空的 records。这个 bug 同时影响 eval 端点（`retriever` 显示 `dense` 而非 `hybrid`）和主问答。
 
 ## 二十、演进
 

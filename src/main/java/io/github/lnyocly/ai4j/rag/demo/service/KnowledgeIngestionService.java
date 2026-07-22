@@ -10,7 +10,6 @@ import io.github.lnyocly.ai4j.rag.ingestion.IngestionTrace;
 import io.github.lnyocly.ai4j.rag.ingestion.IngestionSource;
 import io.github.lnyocly.ai4j.service.PlatformType;
 import io.github.lnyocly.ai4j.service.factory.AiService;
-import io.github.lnyocly.ai4j.vector.store.VectorRecord;
 import io.github.lnyocly.ai4j.vector.store.pgvector.PgVectorStore;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -76,16 +75,17 @@ public class KnowledgeIngestionService {
                             .build())
                     .build());
 
-            // 收集 chunk 到内存语料库（供 Bm25Retriever / 评估端点）
-            if (result.getRecords() != null) {
-                for (VectorRecord record : result.getRecords()) {
-                    inMemoryCorpus.add(permissionTag, RagHit.builder()
-                            .id(record.getId())
-                            .content(record.getContent())
-                            .sourceName(resource.getFilename())
-                            .build());
-                }
-            }
+            // 收集到内存语料库（供 Bm25Retriever / 评估端点）。
+            // 必须用文件内容填，不能用 result.getRecords()——增量摄入（skipExistingContentHash）
+            // 跳过未变更 chunk 时 records 为空，会导致 InMemoryCorpus 空、HybridRetriever 静默退化
+            // 为纯 Dense。corpus 是"库里有什么"的读模型，与 upsert 解耦才对。
+            // demo 每文件 1 chunk，chunkId = docId#chunk-0（与摄入时的 chunk 命名一致）。
+            inMemoryCorpus.add(permissionTag, RagHit.builder()
+                    .id(docId + "#chunk-0")
+                    .content(content)
+                    .sourceName(resource.getFilename())
+                    .build());
+
             total += result.getUpsertedCount();
             IngestionTrace t = result.getTrace();
             log.info("Ingested [{}] {}: upserted={} skipped={} | load={}ms chunk={}ms embed={}ms upsert={}ms total={}ms",
