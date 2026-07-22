@@ -6,9 +6,15 @@ import io.github.lnyocly.ai4j.agent.rag.RagTool;
 import io.github.lnyocly.ai4j.agent.replay.InMemoryIoCaptureSink;
 import io.github.lnyocly.ai4j.agent.replay.NodeIoRecord;
 import io.github.lnyocly.ai4j.agent.tool.StaticToolRegistry;
+import io.github.lnyocly.ai4j.rag.DefaultRagContextAssembler;
+import io.github.lnyocly.ai4j.rag.DefaultRagService;
+import io.github.lnyocly.ai4j.rag.DenseRetriever;
+import io.github.lnyocly.ai4j.rag.NoopReranker;
 import io.github.lnyocly.ai4j.rag.RagService;
+import io.github.lnyocly.ai4j.rag.Retriever;
 import io.github.lnyocly.ai4j.rag.demo.config.RagProperties;
 import io.github.lnyocly.ai4j.rag.demo.domain.ChatRequest;
+import io.github.lnyocly.ai4j.rag.demo.retriever.TenantFilteredRetriever;
 import io.github.lnyocly.ai4j.service.PlatformType;
 import io.github.lnyocly.ai4j.service.factory.AiService;
 import io.github.lnyocly.ai4j.vector.store.pgvector.PgVectorStore;
@@ -49,8 +55,10 @@ public class AgentController {
     public Map<String, Object> ask(@RequestBody ChatRequest request) throws Exception {
         InMemoryIoCaptureSink sink = new InMemoryIoCaptureSink();
 
-        // 1. RAG 作为 agent tool
-        RagService ragService = aiService.getRagService(PlatformType.OLLAMA, vectorStore);
+        // 1. RAG 作为 agent tool ——租户过滤 retriever 包一层，避免 agent 跨租户召回
+        DenseRetriever dense = new DenseRetriever(aiService.getEmbeddingService(PlatformType.OLLAMA), vectorStore);
+        Retriever filtered = TenantFilteredRetriever.forTenant(dense, request.getTenantId());
+        RagService ragService = new DefaultRagService(filtered, new NoopReranker(), new DefaultRagContextAssembler());
         RagTool ragTool = RagTool.builder(ragService)
                 .dataset(ragProperties.getDataset())
                 .embeddingModel(ragProperties.getEmbeddingModel())

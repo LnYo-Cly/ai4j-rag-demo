@@ -12,9 +12,15 @@ import io.github.lnyocly.ai4j.agent.tool.StaticToolRegistry;
 import io.github.lnyocly.ai4j.agent.tool.ToolExecutor;
 import io.github.lnyocly.ai4j.agent.tool.TraceableToolExecutor;
 import io.github.lnyocly.ai4j.platform.openai.tool.Tool;
+import io.github.lnyocly.ai4j.rag.DefaultRagContextAssembler;
+import io.github.lnyocly.ai4j.rag.DefaultRagService;
+import io.github.lnyocly.ai4j.rag.DenseRetriever;
+import io.github.lnyocly.ai4j.rag.NoopReranker;
 import io.github.lnyocly.ai4j.rag.RagService;
+import io.github.lnyocly.ai4j.rag.Retriever;
 import io.github.lnyocly.ai4j.rag.demo.config.RagProperties;
 import io.github.lnyocly.ai4j.rag.demo.domain.ChatRequest;
+import io.github.lnyocly.ai4j.rag.demo.retriever.TenantFilteredRetriever;
 import io.github.lnyocly.ai4j.rag.demo.service.MockOrderService;
 import io.github.lnyocly.ai4j.rag.demo.service.MockTicketService;
 import io.github.lnyocly.ai4j.service.PlatformType;
@@ -60,8 +66,11 @@ public class CustomerServiceAgentController {
     public Map<String, Object> ask(@RequestBody ChatRequest request) throws Exception {
         InMemoryIoCaptureSink sink = new InMemoryIoCaptureSink();
 
-        // ① 知识检索 tool（RAG）
-        RagService ragService = aiService.getRagService(PlatformType.OLLAMA, vectorStore);
+        // ① 知识检索 tool（RAG）——用租户过滤的 retriever 包一层，避免 agent 路径跨租户召回
+        // （RagTool 内部建 RagQuery 不带 filter，否则 default 租户会拿到 premium 文档）
+        DenseRetriever dense = new DenseRetriever(aiService.getEmbeddingService(PlatformType.OLLAMA), vectorStore);
+        Retriever filtered = TenantFilteredRetriever.forTenant(dense, request.getTenantId());
+        RagService ragService = new DefaultRagService(filtered, new NoopReranker(), new DefaultRagContextAssembler());
         RagTool knowledgeTool = RagTool.builder(ragService)
                 .dataset(ragProperties.getDataset())
                 .embeddingModel(ragProperties.getEmbeddingModel())
