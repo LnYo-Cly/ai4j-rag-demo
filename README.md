@@ -1,7 +1,7 @@
 # ai4j-rag-demo
 
 > 企业级 RAG 开箱即用 demo：**ai4j + PgVector + Ollama embedding + GLM**。
-> 对照「Spring Boot + Spring AI Alibaba + Redis」的实战，用更少的代码、更务实的本地组件，跑通同一条 RAG 链路。
+> 用更少的代码、更务实的本地组件，跑通一条完整的企业级 RAG 链路（摄入 → 多租户检索 → 重排 → 生成 → 可观测）。
 
 ## 它演示了什么
 
@@ -16,11 +16,11 @@
 
 | 角色 | 选型 | 说明 |
 |---|---|---|
-| SDK | **ai4j 2.4.0** | 统一 VectorStore / RAG / 多协议 LLM 接入 |
-| 向量库 | **PgVector** | 复用 PostgreSQL，过滤能力强，无需另装 Redis Stack |
-| embedding | **Ollama + Qwen3-Embedding-0.6B** | 本地、免费、中文好 |
-| 生成 | **GLM（Anthropic Messages 协议）** | 走 coding-plan 兼容入口 |
-| 框架 | Spring Boot 3.2 | ai4j starter 实测在 SB 3 可用 |
+| SDK | **ai4j 2.4.1**（Central 已发布，clone-and-run） | 统一 VectorStore / RAG / 多协议 LLM 接入 |
+| 向量库 | **PgVector** | 复用 PostgreSQL，过滤能力强，无需另装向量服务 |
+| embedding | **Ollama + Qwen3-Embedding-0.6B** | 本地、免费、中文好（1024 维） |
+| 生成 | **GLM（Anthropic Messages 协议）** | 走 coding-plan 兼容入口（api/anthropic） |
+| 框架 | Spring Boot 2.7.18（JDK 8） | ai4j starter 原生兼容 SB 2.x；SB 3 / JDK 17 也实测可用 |
 
 ## 前置条件
 
@@ -54,6 +54,19 @@ ai:
     api-host: https://open.bigmodel.cn/api/anthropic/
     api-key: ${GLM_API_KEY}      # 从环境变量读
 ```
+
+### 可开关的特性（`rag.*`）
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| `rag.planner-enabled` | true | Query Planning（GLM 生成 query variants 多路召回融合） |
+| `rag.hybrid-enabled` | true | Hybrid 检索（Dense + 内存 BM25 + RRF 融合，子路容错） |
+| `rag.online-eval-enabled` | true | 在线评估（每答打 faithfulness/contextRelevance 分，走 ANTHROPIC 通道） |
+| `rag.conversational-enabled` | true | 多轮对话（RagQuery 带 history，planner 消解 follow-up 指代） |
+| `rag.max-context-tokens` | 4000 | TokenAware 上下文预算（0=默认组装器） |
+| `rag.reranker` | llm | 重排策略：none / llm（GLM 打分）/ jina（专用模型，国内需 proxy） |
+
+全默认开箱即用；想关某项改 `application.yml` 或传环境变量即可。
 
 ## 跑起来
 
@@ -96,7 +109,7 @@ curl -X POST http://localhost:8080/api/agent/ask \
   -d '{"question": "秒杀商品签收后还能申请退款吗？", "tenantId": "default"}'
 ```
 
-返回里的 `capturedNodes` 含 `MODEL`（思考/生成）+ `TOOL`（RAG 检索）节点——证明 RAG 接入了 agent 的可观测链路（需 ai4j-agent 2.4.0+，含 `RagTool`）。
+返回里的 `capturedNodes` 含 `MODEL`（思考/生成）+ `TOOL`（RAG 检索）节点——证明 RAG 接入了 agent 的可观测链路（需 ai4j-agent，含 `RagTool`）。
 
 ## 换自己的知识
 
@@ -104,4 +117,4 @@ curl -X POST http://localhost:8080/api/agent/ask \
 
 ## ai4j 让 RAG 多简洁
 
-对照同一套链路，ai4j 把那篇文章里手写的 EmbeddingGateway / VectorRepository / 检索编排等都收进了 SDK，应用层只剩"编排 + 业务"。详见 [docs/blog.md](docs/blog.md)。
+ai4j 把 embedding 接入 / 向量检索 / 重排 / 上下文组装 / agent 可观测等都收进了 SDK，应用层只剩"编排 + 业务"。详见 [docs/blog.md](docs/blog.md)。

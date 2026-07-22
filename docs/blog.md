@@ -996,14 +996,36 @@ GET /actuator/prometheus         → rag_cache_size / rag_cache_gets_total{resul
 `rag_cache_*`（answer cache 命中率/eviction）+ `rag_ask_requests_total`（入站请求计数，HPA 17.3 用）都由 demo 的 `RagMetrics` 绑定。这几行不是脚手架——apply 到集群就能用。
 
 ## 十九、常见坑位
-1. 只 TopK 向量不过滤 → 串库/越权（用 dataset+filter 前置）
-2. chunk 切太碎/太大
-3. 缓存 key 不带版本 → 知识更新后旧答案
-4. 只盯模型不看检索
-5. 没有拒答策略 → 幻觉（system prompt 约束）
+
+**RAG 设计层**：
+1. 只 TopK 向量不过滤 → 串库/越权（用 dataset + filter 前置，15.1）
+2. chunk 切太碎/太大 → 召回粗或丢上下文，按模型 token 窗口 + 实测调
+3. 缓存 key 不带版本 → 知识更新后吐旧答案（key 带 tenant + 规范化问题 + 可选 content-hash 版本）
+4. 只盯模型不看检索 → 检索烂了再强的模型也救不回，先看 RagTrace 的 retrievedHits
+5. 没有拒答策略 → 幻觉（system prompt 约束"资料不足就说无法确认"）
+
+**Spring / SDK 工程层**：
 6. **`@Order` 对 `@Bean ApplicationRunner` 不可靠**（demo 实测建表没跑、摄入先跑报表不存在）→ 改 `@PostConstruct`
 7. **starter 默认装配多个 VectorStore bean**（PgVector/Pinecone）→ 注入具体类型 `PgVectorStore` 而非接口
-8. **Ollama 无 `/api/rerank`** → 用 LlmReranker 兜底，或接 cloud rerank
+8. **Ollama 无 `/api/rerank`** → 用 LLM 兜底重排（demo `LlmReranker`），或接 cloud rerank（Jina/Doubao）；SDK 即将提供 `ChatReranker`（LLM-as-reranker via IChatService）
+
+**本 demo 实测踩到的坑（都花过时间排查，记这省你重踩）**：
+
+9. **GLM 双端点 key 陷阱**：coding-plan key 只对 `api/anthropic` 有效，打 `paas/v4`（OpenAI 兼容网关）报 `HTTP 429 code 1113 余额不足`。**关键认知**：`IChatService` 是 platform-polymorphic——`getChatService(PlatformType.ANTHROPIC)` 返回 `AnthropicChatService`（OpenAI⇄Anthropic 适配器，走 api/anthropic）。所以 judge/planner/reranker 用 coding-plan key 时一律 `PlatformType.ANTHROPIC`，别用 `ZHIPU`（那条走 paas/v4）。不是 key 坏、不是 GLM 挂，是端点选错。
+
+10. **curl 中文请求体编码**：Git-bash 下 `curl -d '{"question":"退款怎么弄"}'` 会把中文按非 UTF-8 发 → `400 Invalid UTF-8 middle byte 0xcb`。用 UTF-8 请求文件：`python -c "import json;json.dump({...},open('G:/tmp/req.json','w',encoding='utf-8'))"` 再 `curl -d @G:/tmp/req.json`。（Postman/前端无此问题，纯 shell 测试的坑。）
+
+11. **MSYS 路径分裂**：同一个 `/g/tmp/x.json`，curl.exe（Windows 原生）和 Windows python 解析到不同物理路径（一个找不到文件）→ 统一用 `G:/tmp/x.json`（Windows 盘符 + 正斜杠，两边都认）。
+
+12. **SDK 仓库 `skipTests` 默认 true**：裸 `mvn test` 直接 "Tests are skipped." 静默跳过全部测试 → 假绿。必须 `mvn test -DskipTests=false`。CI 配置要确认带了覆盖，否则零覆盖还以为在跑测试。
+
+13. **依赖锁 SNAPSHOT 破坏 clone-and-run**：pom 用 `2.4.2-SNAPSHOT` 时，clone 下来的人拉不到（Central 没有）→ 必须先构建 SDK。demo 要锁 Central 已发布版本（2.4.1），保住开箱即用。
+
+14. **embedding 冷启动慢**：首次 Ollama embed 要把模型加载进 VRAM，demo 实测第一个 chunk **39 秒**（后续降到几百毫秒）。别当成超时故障；生产可预热或接受冷启动。
+
+15. **Jina rerank 国内需 proxy**：`api.jina.ai` 国内直连超时，要走代理（`-Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=10809`）或换 GLM 兜底重排。
+
+16. **readiness 启动期 OUT_OF_SERVICE**：`ApplicationRunner`（摄入）跑的时候 readiness 是 `OUT_OF_SERVICE`（503），跑完才 `UP`。K8s 探针的 `initialDelaySeconds` 要留够摄入时间，否则 Pod 起来就被摘流量循环重启。
 
 ## 二十、演进
 
@@ -1126,7 +1148,58 @@ NODE MODEL step=2  dur=2530ms  inTok=719 outTok=110   ← 综合生成
 **每一环都能单独审视，精准定位不足**——这就是可观测系统对 agent 的价值，也是 `IoCaptureSink` 的意义（还能重放、从失败点恢复、审计）。
 
 ## 二十一、生产落地检查清单
-架构（离在线解耦/版本化/接口抽象）/ 检索（过滤/chunk/rerank/拒答）/ 工程（缓存/线程池/限流熔断降级/异常演练）/ 安全（先过滤再生成/脱敏/审计）/ 观测（RagTrace 看召回排序/缓存命中/评测集）。
+
+上线前逐条过一遍。每条都标了在本文哪章落实 + 为什么。☐ = 待你按业务确认。
+
+### 摄入（离线，第 10 章）
+- ☑ **增量摄入**：开 `skipExistingContentHash`，未变更 chunk 跳过 embed+upsert（10.5，省 embedding 成本）
+- ☑ **documentId 确定性派生**：`UUID.nameUUIDFromBytes(filename)`，重启幂等 upsert 同 chunkId（10.3）
+- ☑ **dataset 版本化**：`ecommerce-kb-v1/v2`，embedding 模型/分词变了的灰度边界（7 原则 4、17.4）
+- ☑ **多租户权限标签前置写入**：`permissionTag=public/premium` 进 metadata（10.3、15）
+- ☐ **chunk 大小校准**：太大召回粗、太小丢上下文；按 embedding 模型 token 窗口 + 实测召回率调（19 坑位 2）
+
+### 检索（在线，第 11/12 章）
+- ☑ **过滤前置到 KNN 之前**：`VectorSearchRequest.filter` 走 SQL where，不是召回后再滤（12.4、15.1——串库/越权是 RAG 最危险的事）
+- ☑ **dataset 硬隔离**：租户/业务线分 dataset，不只是 filter（15.1）
+- ☑ **topK 合理**：召回 topK > 重排 topN，给 reranker 余量（11.2）
+- ☐ **要不要 Hybrid**：纯 Dense 够就别加 BM25（复杂度+corpus 同步）；召回质量不够再上 Hybrid（11.2、18.3）
+- ☐ **BM25 corpus 租户隔离**：BM25 用 public corpus，别把 premium 灌进去泄漏（demo `buildRagService` 注释）
+
+### 重排（11.2）
+- ☐ **reranker 取舍**：`none`（成本敏感/召回已够）→ `llm`（无专用模型兜底）→ `jina`（精度最高、多一次 API）。不是每条链路都要 reranker
+- ☑ **rerank 软失败**：reranker 挂了用召回顺序兜底，别让重排挂掉整条问答（SDK `Reranker` SPI + demo 降级）
+
+### 生成（13.7、11.4）
+- ☑ **拒答约束**：system prompt 明确"资料不足就说无法确认，不编造"（防幻觉）
+- ☑ **token 预算**：`TokenAwareRagContextAssembler` 控 context 不超 `max_tokens`（11.4）
+- ☑ **usage 捕获**：每答记 input/output tokens（16.5，成本可见）
+
+### 可观测（第 16 章）
+- ☑ **RAG 级 per-step trace**：rewrittenQuery/retrievedHits/rerankedHits/context 全暴露（16.1、18.7）
+- ☑ **online eval**：开 `online-eval-enabled`，每答 faithfulness/contextRelevance 分（16.3、18.8）
+- ☑ **缓存指标**：Caffeine 命中率/eviction 接 Micrometer（16 章、18.9）
+- ☑ **actuator 探针**：readiness/liveness + prometheus 端点（17.1、18.9）
+- ☐ **评测集回归**：`/api/rag/evaluate` 跑 Recall@K/MRR/NDCG，知识更新后回归（13.6）
+
+### 安全（第 15 章）
+- ☑ **权限过滤在生成之前**：先 filter 再 assemble 再 generate，绝不反过来
+- ☑ **API key 走 Secret/env**：`GLM_API_KEY` 不进 git、不进镜像（17.1）
+- ☐ **敏感信息脱敏**：第二层保护，不等于权限隔离（15.4）
+- ☐ **prompt injection**：用户输入可能污染检索/生成，考虑 guardrail plugin（20 演进）
+
+### 成本与性能（14 章、17.4）
+- ☑ **answer 缓存**：Caffeine，key 带 tenant + 规范化问题（14.4、19 坑位 3）
+- ☑ **连接池收敛**：HikariCP 按副本限连接，别打满 PG `max_connections`（17.4）
+- ☑ **GLM 超时调大**：OkHttp readTimeout 60s+，长 context 生成常 >10s（17.4）
+- ☐ **embedding 冷启动**：首次 embed 慢（模型加载 VRAM，demo 实测首 chunk 39s），预热或接受（19 坑位）
+
+### 工程与发布（17 章、19 坑位）
+- ☑ **依赖锁已发布版本**：pom 用 Central 上的 release（如 2.4.1），别用 SNAPSHOT——否则 clone-and-run 断（19 坑位）
+- ☑ **JDK8 容器内存**：`-XX:+UseContainerSupport -XX:MaxRAMPercentage=75`，不然 K8s 限内存被 OOMKilled（17.1）
+- ☑ **滚动发布索引一致性**：模型/分词变了用 dataset 版本化蓝绿切，新老副本读不同版本（17.4——RAG 上线和 Web 服务最大区别）
+- ☐ **UTF-8 全链路**：中文请求体确认 UTF-8 编码（curl 在某些 shell 下会把中文按非 UTF-8 发，19 坑位）
+
+> 一句话总览：**检索有质量、生成有依据、权限前置、每步可观测、成本可见、故障降级**——六条达标即可上线。
 
 ## 二十二、总结 + ai4j 当前真实不足
 
@@ -1139,13 +1212,14 @@ NODE MODEL step=2  dur=2530ms  inTok=719 outTok=110   ← 综合生成
 1. **Query Rewrite**：demo 已实装（`QueryRewriteService`，GLM 改写，实测"退款怎么弄"→"退款操作流程"）；ai4j core 暂未提供统一 `QueryRewriter` 接口（按需补，当前应用层几十行即可）
 2. **RAG 链路缓存无**（有意）——失效/key 维度强业务相关，留给应用层（demo 用 Caffeine）
 3. ~~RAG-as-Agent-Tool 无现成封装~~ **已解决（ai4j 2.4.0）**：`RagTool`（PR #172）+ `AgentBuilder.capture()` 让 RAG 作为 agent tool 接入统一可观测链路
-4. **Ollama 无 `/api/rerank` 端点**——`OllamaRerankService` 在 Ollama 上 404，本地 rerank 要用 LlmReranker 兜底或接 cloud（Jina/Doubao）
-5. **starter 默认装配多个 VectorStore bean**——注入接口 `VectorStore` 会歧义，要注入具体类型
-6. **starter 编译于 Spring Boot 2.3**（Java 8 约束）——在 SB 2.x（如本文的 2.7）原生兼容；SB 3 / JDK 17 项目也实测可用
-7. **`@PostConstruct` 用 javax**（starter 内）——SB 3 靠 `javax.annotation-api` 兜，实测可用但非 jakarta 原生
-8. **starter 的 pineconeVectorStore 无 `@ConditionalOnProperty` 守卫**——总被创建（导致上述多 bean 歧义）
+4. **LLM 重排 / Ollama rerank**——Ollama 无 `/api/rerank` 端点（`OllamaRerankService` 在纯 Ollama 上 404）。**但"只有 chat 模型也要能重排"这个真缺口已被 `ChatReranker` 闭合**（LLM-as-reranker via `IChatService`，分支 `codex/add-chatreranker-...`，即将进 release）：任何 chat 平台（含 ANTHROPIC/coding-plan key）都能 `getChatReranker(platform, model)` 重排，demo 的本地 `LlmReranker` 届时可替换为 SDK 版本。2.4.1 上 demo 仍用本地兜底。
+5. **embedding 平台覆盖窄**——SDK 只内置 `OpenAiEmbeddingService` + `OllamaEmbeddingService`（chat 有 12 平台，embedding 只有 2）。**非硬缺口**：`OpenAiEmbeddingService.embedding(baseUrl, apiKey, req)` 支持 per-call 端点覆盖，任何 OpenAI 兼容 embedding 平台（DashScope/Doubao/Zhipu 都有 `/v1/embeddings`）能走通，只是得配成"openai 指向别处"而非 `PlatformType.DASHSCOPE`。易用性缺口，非功能断。
+6. **starter 默认装配多个 VectorStore bean**——注入接口 `VectorStore` 会歧义，要注入具体类型
+7. **starter 编译于 Spring Boot 2.3**（Java 8 约束）——在 SB 2.x（如本文的 2.7）原生兼容；SB 3 / JDK 17 项目也实测可用
+8. **`@PostConstruct` 用 javax**（starter 内）——SB 3 靠 `javax.annotation-api` 兜，实测可用但非 jakarta 原生
+9. **starter 的 pineconeVectorStore 无 `@ConditionalOnProperty` 守卫**——总被创建（导致上述多 bean 歧义）
 
-这些不是"不能用于生产"，而是**用之前要知道、绕过或自补**。前 3 个是 SDK 能力缺口（QueryRewrite/Cache 可补，RAG-as-tool 看场景）；后 5 个是 starter 的工程小毛病（多 bean 守卫、SB 版本、jakarta 迁移），改起来不难。
+这些不是"不能用于生产"，而是**用之前要知道、绕过或自补**。1/2 是应用层自补（QueryRewrite 几十行、Cache 用 Caffeine）；3 已解决；4（LLM 重排）已被 `ChatReranker` 闭合、5（embedding 广度）有 per-call 覆盖绕过；6-9 是 starter 的工程小毛病（多 bean 守卫、SB 版本、jakarta 迁移），改起来不难。**没有阻塞生产的硬缺口**——demo 都绕过或自补了。
 
 ---
 
