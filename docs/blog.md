@@ -1,8 +1,6 @@
 # 为你的 JDK8 老项目，增加企业级的 RAG 系统
 
-> 很多团队的核心业务还跑在 JDK 8 + Spring Boot 2.x 上——升级 JDK 17 + SB 3 牵一发而动全身，短期不动；但 AI/RAG 又是必须补的能力。本文就用 **Spring Boot 2.7（JDK 8 末代 LTS）+ ai4j + PostgreSQL/pgvector + 本地 Ollama + GLM**，给一个 JDK8 老项目加上一整套企业级 RAG：摄入、Query Rewrite、混合检索、重排、多租户、评估、缓存、可观测 trace、引用溯源——配套 [开箱即用的 demo](https://github.com/LnYo-Cly/ai4j-rag-demo)，每个能力都真实跑过，下面所有运行结果都是 demo 实际输出。
-
-> 本文用一套更轻、更通用的技术栈——Java AI SDK **ai4j** + 你大概率已经有的 **PostgreSQL/pgvector** + 本地免费的 **Ollama embedding** + **GLM** 生成——从原理、架构、12 条设计原则、生产代码、高并发、多租户、可观测、部署一路讲到真实案例与检索质量评估。配套 [开箱即用的 demo](https://github.com/LnYo-Cly/ai4j-rag-demo) 里，**每一个能力都真实跑过**，下面所有运行结果都是 demo 实际输出，不是杜撰。
+> 很多团队的核心业务还跑在 JDK 8 + Spring Boot 2.x 上——升 JDK 17 + SB 3 牵一发而动全身，短期不动；但 AI/RAG 又是必须补的能力。本文用 **Spring Boot 2.7（JDK 8 末代 LTS）+ ai4j + PostgreSQL/pgvector + 本地 Ollama + GLM**，从原理、架构、12 条设计原则、生产代码、高并发、多租户、可观测、部署一路讲到真实案例与检索质量评估，给 JDK8 老项目加上一整套企业级 RAG。配套 [开箱即用的 demo](https://github.com/LnYo-Cly/ai4j-rag-demo)：**每个能力都真实跑过，下面所有运行结果都是 demo 实际输出，不是杜撰。**
 
 ---
 
@@ -433,6 +431,9 @@ public void initSchema() {
 > 坑：不要用两个 `@Bean ApplicationRunner`+`@Order` 保证建表先于摄入——`@Order` 对 `@Bean` runner 不可靠。用 `@PostConstruct`（早于所有 ApplicationRunner）。
 
 ### 13.4 主链 RagQueryService（Dense + ChatReranker + 多租户 + Caffeine 缓存）
+
+> 下面是主链**骨架**，只突出"缓存 → 多租户过滤 → 检索 → 重排 → 组装 → 生成 → 写缓存"的主干。为清晰省略了：try/catch 整体降级（14.3）、online eval 打分（16.3）、token 用量捕获（16.5）、Hybrid/Planner 的 per-request 构造（11.2）、actuator 指标绑定（18.9）——这些在对应章节展开。**完整代码见 demo 的 `RagQueryService`**（真实构造器是 7 参 Spring 注入，`RagService` 按 hybrid 开关 per-request 构建，不是下面这个固定字段）。
+
 ```java
 public RagQueryService(AiService aiService, PgVectorStore vectorStore, RagProperties props) {
     this.messagesService = aiService.getMessagesService(PlatformType.ANTHROPIC);
@@ -450,7 +451,7 @@ public RagAnswer ask(ChatRequest req) throws Exception {
     RagAnswer cached = answerCache.getIfPresent(key);
     if (cached != null) { cached.setCached(true); return cached; }
 
-    // 多租户：权限标签前置过滤
+    // 多租户：权限标签前置过滤（15 章）
     Map<String,Object> filter = new LinkedHashMap<>();
     filter.put("permissionTag", permissionTagsFor(req.getTenantId())); // default→[public], premium→[public,premium]
 
@@ -460,6 +461,8 @@ public RagAnswer ask(ChatRequest req) throws Exception {
             .filter(filter).build());
     String context = result.getContext() == null ? "" : result.getContext();
     String answer = generate(req.getQuestion(), context, context.isBlank()); // GLM，带拒答约束
+
+    // 此处还会：online eval 打分挂 scores（16.3）、捕获 token 用量（16.5）、整链异常降级兜底（14.3）
     RagAnswer a = RagAnswer.builder().answer(answer)
             .references(mapCitations(result.getCitations()))
             .hitCount(result.getHits().size()).degraded(context.isBlank()).cached(false).build();
