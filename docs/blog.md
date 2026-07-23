@@ -259,6 +259,8 @@ public String rewrite(String query) throws Exception {
 
 **为什么未必？** 向量召回本身就有相似度分数排序；混合检索（Dense 向量 + Bm25 关键词 + RRF 融合）更进一步——两路召回的交叉验证已经是很强的排序信号。ai4j 的 `HybridRetriever` 就是这么做的：把 `DenseRetriever`（向量）和 `Bm25Retriever`（关键词，纯内存、构造时建倒排、不需要 ES）的结果用 `FusionStrategy`（默认 RRF 倒数排名融合）合并，每个 hit 的最终分是两路的融合分，还带 `RagScoreDetail`（哪个 retriever 贡献多少）——排序可解释，不靠黑盒。
 
+> **RRF（Reciprocal Rank Fusion，倒数排名融合）凭什么有用**：Dense 的相似度（0~1）和 BM25 的 TF-IDF 分（可能 >1）**分数不可比**——直接相加会被量纲大的那路 dominate。RRF 不看绝对分数、只看**排名**：`score = Σ 1/(k + rank)`（k≈60 平滑常数），某文档在两路都排靠前 → 融合分高。好处是不用调权重、对分数尺度不敏感，是跨检索器融合的事实标准。ai4j 还提供 RSF（相对得分）/ DBSF（双路加权）做对比。
+
 **那 reranker 什么时候才值？** 当：
 - 召回 TopK 噪声大（知识库杂、query 模糊），前几名里有明显不相关
 - 精度敏感（客服答错代价高、合规要求引用准确）
