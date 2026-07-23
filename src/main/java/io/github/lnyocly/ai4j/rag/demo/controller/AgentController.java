@@ -6,15 +6,9 @@ import io.github.lnyocly.ai4j.agent.rag.RagTool;
 import io.github.lnyocly.ai4j.agent.replay.InMemoryIoCaptureSink;
 import io.github.lnyocly.ai4j.agent.replay.NodeIoRecord;
 import io.github.lnyocly.ai4j.agent.tool.StaticToolRegistry;
-import io.github.lnyocly.ai4j.rag.DefaultRagContextAssembler;
-import io.github.lnyocly.ai4j.rag.DefaultRagService;
-import io.github.lnyocly.ai4j.rag.DenseRetriever;
-import io.github.lnyocly.ai4j.rag.NoopReranker;
 import io.github.lnyocly.ai4j.rag.RagService;
-import io.github.lnyocly.ai4j.rag.Retriever;
 import io.github.lnyocly.ai4j.rag.demo.config.RagProperties;
 import io.github.lnyocly.ai4j.rag.demo.domain.ChatRequest;
-import io.github.lnyocly.ai4j.rag.demo.retriever.TenantFilteredRetriever;
 import io.github.lnyocly.ai4j.service.PlatformType;
 import io.github.lnyocly.ai4j.service.factory.AiService;
 import io.github.lnyocly.ai4j.vector.store.pgvector.PgVectorStore;
@@ -26,6 +20,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -55,14 +50,13 @@ public class AgentController {
     public Map<String, Object> ask(@RequestBody ChatRequest request) throws Exception {
         InMemoryIoCaptureSink sink = new InMemoryIoCaptureSink();
 
-        // 1. RAG 作为 agent tool ——租户过滤 retriever 包一层，避免 agent 跨租户召回
-        DenseRetriever dense = new DenseRetriever(aiService.getEmbeddingService(PlatformType.OLLAMA), vectorStore);
-        Retriever filtered = TenantFilteredRetriever.forTenant(dense, request.getTenantId());
-        RagService ragService = new DefaultRagService(filtered, new NoopReranker(), new DefaultRagContextAssembler());
+        // 1. RAG 作为 agent tool ——SDK 2.4.2 RagTool.filter() 服务端固定注入租户过滤（不进 tool schema，LLM 改不了）
+        RagService ragService = aiService.getRagService(PlatformType.OLLAMA, vectorStore);
         RagTool ragTool = RagTool.builder(ragService)
                 .dataset(ragProperties.getDataset())
                 .embeddingModel(ragProperties.getEmbeddingModel())
                 .topK(ragProperties.getTopK())
+                .filter(tenantFilterFor(request.getTenantId()))
                 .build();
 
         // 2. Agent + capture(sink)：MODEL/TOOL 节点 I/O 全捕获
@@ -108,5 +102,14 @@ public class AgentController {
         resp.put("capturedToolNodes", toolNodes);
         resp.put("capturedNodes", capturedNodes);
         return resp;
+    }
+
+    /** 租户 → permissionTag 过滤（premium 可见 public+premium，其余仅 public）。服务端固定，不暴露给模型。 */
+    private static Map<String, Object> tenantFilterFor(String tenantId) {
+        Map<String, Object> filter = new LinkedHashMap<String, Object>();
+        filter.put("permissionTag", "premium".equals(tenantId)
+                ? Arrays.asList("public", "premium")
+                : Collections.singletonList("public"));
+        return filter;
     }
 }

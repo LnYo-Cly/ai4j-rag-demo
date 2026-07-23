@@ -31,7 +31,6 @@ import io.github.lnyocly.ai4j.rag.demo.config.RagProperties;
 import io.github.lnyocly.ai4j.rag.demo.domain.ChatRequest;
 import io.github.lnyocly.ai4j.rag.demo.domain.RagAnswer;
 import io.github.lnyocly.ai4j.rag.demo.domain.ReferenceItem;
-import io.github.lnyocly.ai4j.rag.demo.rerank.LlmReranker;
 import io.github.lnyocly.ai4j.service.IMessagesService;
 import io.github.lnyocly.ai4j.service.PlatformType;
 import io.github.lnyocly.ai4j.service.factory.AiService;
@@ -52,7 +51,7 @@ import java.util.Map;
  * 输入 → 改写（rewrittenQuery）→ 召回（retrievedHits）→ 重排（rerankedHits）→ 上下文（context）→ 生成（answer）→ 输出。
  *
  * 检索：DenseRetriever（PgVector KNN，带多租户 permissionTag 前置过滤）
- * 重排：LlmReranker（GLM 打分）
+ * 重排：ChatReranker（SDK 2.4.2，GLM 打分）
  * 生成：GLM via IMessagesService（Anthropic Messages，拒答约束）
  * 缓存：Caffeine（key = tenant::originalQuestion）
  */
@@ -262,7 +261,10 @@ public class RagQueryService {
         if ("jina".equals(mode)) {
             return aiService.getModelReranker(PlatformType.JINA, ragProperties.getJinaRerankModel());
         }
-        return new LlmReranker(this.messagesService, ragProperties.getGlmModel(), ragProperties.getTopK());
+        // llm（默认）：SDK 2.4.2 的 ChatReranker（LLM-as-reranker via IChatService）。
+        // 走 PlatformType.ANTHROPIC → AnthropicChatService → coding-plan key 可用。
+        return aiService.getChatReranker(PlatformType.ANTHROPIC, ragProperties.getGlmModel(),
+                ragProperties.getTopK(), null, true, 20);
     }
 
     /** 暴露缓存统计（命中率/大小），给可观测用。 */

@@ -12,15 +12,9 @@ import io.github.lnyocly.ai4j.agent.tool.StaticToolRegistry;
 import io.github.lnyocly.ai4j.agent.tool.ToolExecutor;
 import io.github.lnyocly.ai4j.agent.tool.TraceableToolExecutor;
 import io.github.lnyocly.ai4j.platform.openai.tool.Tool;
-import io.github.lnyocly.ai4j.rag.DefaultRagContextAssembler;
-import io.github.lnyocly.ai4j.rag.DefaultRagService;
-import io.github.lnyocly.ai4j.rag.DenseRetriever;
-import io.github.lnyocly.ai4j.rag.NoopReranker;
 import io.github.lnyocly.ai4j.rag.RagService;
-import io.github.lnyocly.ai4j.rag.Retriever;
 import io.github.lnyocly.ai4j.rag.demo.config.RagProperties;
 import io.github.lnyocly.ai4j.rag.demo.domain.ChatRequest;
-import io.github.lnyocly.ai4j.rag.demo.retriever.TenantFilteredRetriever;
 import io.github.lnyocly.ai4j.rag.demo.service.MockOrderService;
 import io.github.lnyocly.ai4j.rag.demo.service.MockTicketService;
 import io.github.lnyocly.ai4j.service.PlatformType;
@@ -66,15 +60,13 @@ public class CustomerServiceAgentController {
     public Map<String, Object> ask(@RequestBody ChatRequest request) throws Exception {
         InMemoryIoCaptureSink sink = new InMemoryIoCaptureSink();
 
-        // ① 知识检索 tool（RAG）——用租户过滤的 retriever 包一层，避免 agent 路径跨租户召回
-        // （RagTool 内部建 RagQuery 不带 filter，否则 default 租户会拿到 premium 文档）
-        DenseRetriever dense = new DenseRetriever(aiService.getEmbeddingService(PlatformType.OLLAMA), vectorStore);
-        Retriever filtered = TenantFilteredRetriever.forTenant(dense, request.getTenantId());
-        RagService ragService = new DefaultRagService(filtered, new NoopReranker(), new DefaultRagContextAssembler());
+        // ① 知识检索 tool（RAG）——SDK 2.4.2 RagTool.filter() 服务端固定注入租户过滤（不进 schema，LLM 改不了）
+        RagService ragService = aiService.getRagService(PlatformType.OLLAMA, vectorStore);
         RagTool knowledgeTool = RagTool.builder(ragService)
                 .dataset(ragProperties.getDataset())
                 .embeddingModel(ragProperties.getEmbeddingModel())
                 .topK(ragProperties.getTopK())
+                .filter(tenantFilterFor(request.getTenantId()))
                 .build();
 
         // ② 订单查询 tool
@@ -188,6 +180,15 @@ public class CustomerServiceAgentController {
     private static String truncate(String s, int max) {
         if (s == null) return null;
         return s.length() > max ? s.substring(0, max) + "..." : s;
+    }
+
+    /** 租户 → permissionTag 过滤（premium 可见 public+premium，其余仅 public）。服务端固定，不暴露给模型。 */
+    private static Map<String, Object> tenantFilterFor(String tenantId) {
+        Map<String, Object> filter = new LinkedHashMap<String, Object>();
+        filter.put("permissionTag", "premium".equals(tenantId)
+                ? Arrays.asList("public", "premium")
+                : Collections.singletonList("public"));
+        return filter;
     }
 
     private Tool makeTool(String name, String desc, String paramName, String paramType, String paramDesc) {

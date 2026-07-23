@@ -16,7 +16,7 @@
 
 | 角色 | 选型 | 说明 |
 |---|---|---|
-| SDK | **ai4j 2.4.1**（Central 已发布，clone-and-run） | 统一 VectorStore / RAG / 多协议 LLM 接入 |
+| SDK | **ai4j 2.4.2**（Central 已发布，clone-and-run） | 统一 VectorStore / RAG / 多协议 LLM 接入 |
 | 向量库 | **PgVector** | 复用 PostgreSQL，过滤能力强，无需另装向量服务 |
 | embedding | **Ollama + Qwen3-Embedding-0.6B** | 本地、免费、中文好（1024 维） |
 | 生成 | **GLM（Anthropic Messages 协议）** | 走 coding-plan 兼容入口（api/anthropic） |
