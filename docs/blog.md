@@ -421,7 +421,7 @@ public void initSchema() {
     try (Connection c = DriverManager.getConnection(jdbcUrl, user, pass);
          Statement s = c.createStatement()) {
         s.execute("CREATE EXTENSION IF NOT EXISTS vector");
-        s.execute("CREATE TABLE IF NOT EXISTS " + table + " (id text PK, dataset text, "
+        s.execute("CREATE TABLE IF NOT EXISTS " + table + " (id text PRIMARY KEY, dataset text, "
                 + "content text, metadata jsonb, embedding vector(" + dim + "))");
         s.execute("CREATE INDEX IF NOT EXISTS " + table + "_emb_idx ON " + table
                 + " USING hnsw (embedding vector_cosine_ops)");
@@ -493,7 +493,8 @@ RagService svc = new DefaultRagService(hybrid, new NoopReranker(), new DefaultRa
 for (String[] c : EVAL_SET) {  // {query, 期望文件名}
     RagResult r = svc.search(RagQuery.builder().query(c[0])...topK(5).build());
     String relevantId = chunkIdFor(c[1]); // UUID.nameUUIDFromBytes(filename)#chunk-0
-    RagEvaluation e = new RagEvaluator().evaluate(r.getHits(), List.of(relevantId), 5);
+    RagEvaluation e = new RagEvaluator().evaluate(r.getHits(),
+            Collections.singletonList(relevantId), 5);   // JDK8：用 singletonList 而非 List.of
     // 收集 recallAt5 / mrr / ndcg
 }
 ```
@@ -1117,9 +1118,10 @@ demo 的 `/api/agent/ask` 已经展示了 RAG 作为**单个 tool** 接入 agent
 这就是 RAG"在 agent 里用"的完整形态——RAG 不再是独立链路，而是 agent 的一个能力模块，和业务 tool 平级。用 ai4j 这样搭：
 
 ```java
-// ① 知识检索 tool（RAG）
+// ① 知识检索 tool（RAG）——.filter() 服务端固定注入租户权限（不进 schema，LLM 改不了，见 15 章/坑位 18）
 RagTool knowledgeTool = RagTool.builder(ragService)
-        .dataset("ecommerce-kb").embeddingModel("...").topK(5).build();
+        .dataset("ecommerce-kb").embeddingModel("...").topK(5)
+        .filter(tenantFilterFor(tenantId)).build();
 
 // ② 订单查询 tool（接业务系统）
 Tool orderTool = Tool.function("query_order", "查订单状态/物流", orderParams);
@@ -1131,7 +1133,7 @@ ToolExecutor ticketExecutor = call -> ticketService.create(...);
 
 // 客服 agent：自主编排这三个能力
 Agent customerService = Agents.react().anthropicMessages(key, baseUrl).model("glm-4.6")
-        .system("你是电商客服。根据用户问题，自主决定查订单、查知识库、或建工单。")
+        .systemPrompt("你是电商客服。根据用户问题，自主决定查订单、查知识库、或建工单。")
         .toolRegistry(new StaticToolRegistry(Arrays.asList(
                 knowledgeTool.tool(), orderTool, ticketTool)))
         .toolExecutor(merge(knowledgeTool.executor(), orderExecutor, ticketExecutor))
@@ -1141,6 +1143,8 @@ Agent customerService = Agents.react().anthropicMessages(key, baseUrl).model("gl
 AgentResult r = customerService.newSession().run("我昨天下的单什么时候到，不想要了能退吗？");
 // agent 自主：query_order 查物流 → knowledge_search 查退款规则 → 综合回答（必要时 create_ticket）
 ```
+
+> 上面的 `Tool.function(...)` / `merge(...)` / `extract(...)` 是**示意简写**（SDK 没有这个静态工厂）——`Tool` 的真实构造是手建 `Tool.Function`+参数 schema（demo 的 `makeTool` 封装了这个），`ToolExecutor` 用 `TraceableToolExecutor` 按 tool name 合并分发。`RagTool` / `Agents.react` / `StaticToolRegistry` / `.capture` / `.filter` 都是真实 API，照抄可用。
 
 **这套架构的威力**：
 - **自主编排**：用户一句话，agent 决定调哪些 tool、什么顺序，不用硬编码 if/else 流程
